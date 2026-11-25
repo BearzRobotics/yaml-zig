@@ -631,3 +631,24 @@ test "keys added through the API read as strings" {
     defer back.deinit();
     try testing.expectEqual(@as(usize, 10), back.root.map.count());
 }
+
+test "a flow collection turns into a block one rather than lose anything" {
+    var doc = try parse("cfg: {}\nl: [1, 2]\n");
+    defer doc.deinit();
+    var inner = try doc.newMap();
+    try inner.map.put(doc.allocator(), "deep", doc.boolean(true));
+    try inner.map.setComments(doc.allocator(), "deep", .{ .before = &.{"# keep me"}, .after = "# me too" });
+    doc.root.map.getMap("cfg").?.flow = true;
+    try doc.set(&.{ "cfg", "x" }, inner);
+    try doc.setComments(&.{ "l", "0" }, .{ .before = &.{"# first"} });
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("cfg:\n  x:\n    # keep me\n    deep: true # me too\nl:\n  # first\n  - 1\n  - 2\n", out);
+
+    var root = try parse("[1, 2]\n");
+    defer root.deinit();
+    try root.setComments(&.{"1"}, .{ .after = "# two" });
+    const root_out = try root.toOwnedString(testing.allocator);
+    defer testing.allocator.free(root_out);
+    try testing.expectEqualStrings("- 1\n- 2 # two\n", root_out);
+}

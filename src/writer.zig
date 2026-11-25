@@ -39,14 +39,10 @@ pub fn write(w: *Writer, doc: Doc) Error!void {
     var g: Gen = .{ .w = w, .step = @max(doc.indent, 1) };
     try g.lines(doc.header, 0);
     if (doc.explicit_start) try w.writeAll("---\n");
-    switch (doc.root) {
-        .map => |m| if (m.count() != 0 and !m.flow) {
-            try g.map(m, 0, false);
-        } else try g.rootInline(doc.root),
-        .seq => |q| if (q.items.items.len != 0 and !q.flow) {
-            try g.seq(q, 0);
-        } else try g.rootInline(doc.root),
-        .scalar => try g.rootInline(doc.root),
+    if (isInline(doc.root)) try g.rootInline(doc.root) else switch (doc.root) {
+        .map => |m| try g.map(m, 0, false),
+        .seq => |q| try g.seq(q, 0),
+        .scalar => unreachable,
     }
     try g.lines(doc.footer, 0);
 }
@@ -73,6 +69,28 @@ fn checkUtf8(v: Value) error{InvalidUtf8}!void {
                 try checkUtf8(item);
             }
             for (m.comments.values()) |c| try checkComment(c);
+        },
+    }
+}
+
+/// Whether `v` is written on one line: a scalar, an empty collection, or a
+/// flow collection that can still be written as one without loss. It cannot
+/// if it holds a block collection or a comment.
+fn isInline(v: Value) bool {
+    switch (v) {
+        .scalar => return true,
+        .seq => |q| {
+            if (q.items.items.len == 0) return true;
+            if (!q.flow) return false;
+            for (q.items.items) |item| if (!isInline(item)) return false;
+            for (q.comments.items) |c| if (!c.isEmpty()) return false;
+            return true;
+        },
+        .map => |m| {
+            if (m.count() == 0) return true;
+            if (!m.flow) return false;
+            for (m.entries.values()) |item| if (!isInline(item)) return false;
+            return m.comments.count() == 0;
         },
     }
 }
@@ -145,7 +163,7 @@ const Gen = struct {
         for (q.items.items, q.comments.items) |item, c| {
             try self.lines(c.before, indent);
             switch (item) {
-                .map => |m| if (m.count() != 0 and !m.flow) {
+                .map => |m| if (!isInline(item)) {
                     // Comments above the first key sit above the dash.
                     const first = m.comments.get(m.entries.keys()[0]) orelse Comments{};
                     try self.lines(first.before, indent);
@@ -175,23 +193,18 @@ const Gen = struct {
                 try self.scalarInline(s, false);
                 try self.tail(after);
             },
-            .seq => |q| {
-                if (q.items.items.len == 0 or (q.flow and flowable(v))) {
+            .seq, .map => {
+                if (isInline(v)) {
                     try self.w.writeByte(' ');
                     try self.flow(v);
                     return self.tail(after);
                 }
                 try self.tail(after);
-                try self.seq(q, indent + self.step);
-            },
-            .map => |m| {
-                if (m.count() == 0 or (m.flow and flowable(v))) {
-                    try self.w.writeByte(' ');
-                    try self.flow(v);
-                    return self.tail(after);
+                switch (v) {
+                    .seq => |q| try self.seq(q, indent + self.step),
+                    .map => |m| try self.map(m, indent + self.step, false),
+                    .scalar => unreachable,
                 }
-                try self.tail(after);
-                try self.map(m, indent + self.step, false);
             },
         }
     }
@@ -199,7 +212,7 @@ const Gen = struct {
     /// The value after `-` (a mapping that is written on the dash's line is handled by `seq`).
     fn itemValue(self: *Gen, v: Value, after: ?[]const u8, indent: usize) Error!void {
         switch (v) {
-            .seq => |q| if (q.items.items.len != 0 and !(q.flow and flowable(v))) {
+            .seq => |q| if (!isInline(v)) {
                 try self.tail(after);
                 return self.seq(q, indent + self.step);
             },
@@ -388,20 +401,6 @@ const Gen = struct {
     }
 
     // ---- flow ------------------------------------------------------------------------
-
-    fn flowable(v: Value) bool {
-        return switch (v) {
-            .scalar => true,
-            .seq => |q| blk: {
-                for (q.items.items) |i| if (!flowable(i)) break :blk false;
-                break :blk true;
-            },
-            .map => |m| blk: {
-                for (m.entries.values()) |i| if (!flowable(i)) break :blk false;
-                break :blk true;
-            },
-        };
-    }
 
     fn flow(self: *Gen, v: Value) Error!void {
         switch (v) {
