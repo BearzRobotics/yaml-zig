@@ -286,34 +286,180 @@ pub const Seq = struct {
     }
 };
 
+/// Compares map keys as YAML does (1.2.2, 3.2.1.3): the same tag and the same
+/// canonical content. `1`, `0x1` and `"1"` are two keys: an integer and a
+/// string.
+pub const KeyContext = struct {
+    pub fn hash(_: KeyContext, key: Value) u32 {
+        var h = std.hash.Wyhash.init(0);
+        var budget: usize = compare_budget;
+        hashValue(&h, key, &budget);
+        return @truncate(h.final());
+    }
+
+    pub fn eql(_: KeyContext, a: Value, b: Value, _: usize) bool {
+        var budget: usize = compare_budget;
+        return sameKey(a, b, &budget);
+    }
+};
+
+/// How many nodes comparing two keys may visit.
+const compare_budget: usize = 1 << 16;
+
+/// The tag that decides what a scalar is: its own, or the one the core schema
+/// gives it.
+fn effectiveTag(s: Scalar) []const u8 {
+    return switch (s.kind) {
+        .null => "tag:yaml.org,2002:null",
+        .boolean => "tag:yaml.org,2002:bool",
+        .integer => "tag:yaml.org,2002:int",
+        .float => "tag:yaml.org,2002:float",
+        .string => "tag:yaml.org,2002:str",
+    };
+}
+
+/// A scalar's canonical content: every spelling of a null, a boolean or a
+/// number that means the same gives the same bytes.
+fn canonical(s: Scalar, buffer: *[64]u8) []const u8 {
+    switch (s.kind) {
+        .null => return "",
+        .boolean => return if (s.asBool() orelse return s.text) "true" else "false",
+        .integer => {
+            const i = parseInt(s.text) orelse return s.text;
+            return std.fmt.bufPrint(buffer, "{d}", .{i}) catch unreachable;
+        },
+        .float => {
+            const f = s.asFloat() orelse return s.text;
+            if (std.math.isNan(f)) return ".nan";
+            // `-0.0` and `0.0` compare equal.
+            return std.fmt.bufPrint(buffer, "{x}", .{@as(u64, @bitCast(if (f == 0) @as(f64, 0) else f))}) catch unreachable;
+        },
+        .string => return s.text,
+    }
+}
+
+fn hashScalar(h: *std.hash.Wyhash, tag: []const u8, content: []const u8) void {
+    h.update(tag);
+    h.update("\x00");
+    h.update(content);
+}
+
+fn hashValue(h: *std.hash.Wyhash, v: Value, budget: *usize) void {
+    if (budget.* == 0) return;
+    budget.* -= 1;
+    switch (v) {
+        .scalar => |s| {
+            var buffer: [64]u8 = undefined;
+            hashScalar(h, effectiveTag(s), canonical(s, &buffer));
+        },
+        .seq => |q| {
+            h.update("[");
+            for (q.items.items) |item| hashValue(h, item, budget);
+        },
+        .map => |m| {
+            // The order of a mapping's keys is not part of its value.
+            var sum: u64 = 0;
+            for (m.entries.keys(), m.entries.values()) |k, e| {
+                var one = std.hash.Wyhash.init(1);
+                hashValue(&one, k, budget);
+                hashValue(&one, e.value, budget);
+                sum +%= one.final();
+            }
+            h.update("{");
+            h.update(std.mem.asBytes(&sum));
+        },
+    }
+}
+
+fn sameKey(a: Value, b: Value, budget: *usize) bool {
+    if (budget.* == 0) return false;
+    budget.* -= 1;
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    switch (a) {
+        .scalar => |s| {
+            if (!std.mem.eql(u8, effectiveTag(s), effectiveTag(b.scalar))) return false;
+            var x: [64]u8 = undefined;
+            var y: [64]u8 = undefined;
+            return std.mem.eql(u8, canonical(s, &x), canonical(b.scalar, &y));
+        },
+        .seq => |q| {
+            if (q == b.seq) return true;
+            if (q.items.items.len != b.seq.items.items.len) return false;
+            for (q.items.items, b.seq.items.items) |i, j| if (!sameKey(i, j, budget)) return false;
+            return true;
+        },
+        .map => |m| {
+            if (m == b.map) return true;
+            if (m.count() != b.map.count()) return false;
+            for (m.entries.keys(), m.entries.values()) |k, e| {
+                const other = b.map.entries.get(k) orelse return false;
+                if (!sameKey(e.value, other.value, budget)) return false;
+            }
+            return true;
+        },
+    }
+}
+
+/// Finds a scalar key written as `text` and typed `kind`.
+const TextKey = struct {
+    kind: Kind,
+
+    pub fn hash(self: TextKey, text: []const u8) u32 {
+        const s: Scalar = .{ .text = text, .kind = self.kind };
+        var buffer: [64]u8 = undefined;
+        var h = std.hash.Wyhash.init(0);
+        hashScalar(&h, effectiveTag(s), canonical(s, &buffer));
+        return @truncate(h.final());
+    }
+
+    pub fn eql(self: TextKey, text: []const u8, key: Value, _: usize) bool {
+        return key == .scalar and key.scalar.kind == self.kind and std.mem.eql(u8, key.scalar.text, text);
+    }
+};
+
 pub const Map = struct {
-    /// Insertion-ordered, so a document written back keeps its key order.
-    entries: std.StringArrayHashMapUnmanaged(Value) = .empty,
-    comments: std.StringArrayHashMapUnmanaged(Comments) = .empty,
+    /// Keys to values, in insertion order, so a document written back keeps its
+    /// key order. A key is any value; most are scalars. A key that is a
+    /// collection must not be changed while it is in the map.
+    entries: Entries = .empty,
     /// Written as `{a: 1, b: 2}`.
     flow: bool = false,
-    /// How keys were written in the source, for those where it matters:
-    /// quoted keys, and plain keys that YAML types as something other than a
-    /// string (`true:`, `12:`). A key without an entry, such as one added
-    /// through the API, is written so that it reads as a string.
-    key_styles: std.StringArrayHashMapUnmanaged(Style) = .empty,
 
-    /// Records how `key`, which must already be in the map, was written.
-    pub fn noteKeyStyle(self: *Map, arena: Allocator, key: []const u8, style: Style) Allocator.Error!void {
-        if (style == .plain and resolve(key) == .string) return;
-        try self.key_styles.put(arena, self.entries.getKey(key).?, style);
-    }
+    pub const Entry = struct {
+        value: Value,
+        comments: Comments = .{},
+    };
+    pub const Entries = std.ArrayHashMapUnmanaged(Value, Entry, KeyContext, true);
 
     pub fn count(self: *const Map) usize {
         return self.entries.count();
     }
 
+    /// The keys in order.
+    pub fn keys(self: *const Map) []const Value {
+        return self.entries.keys();
+    }
+
+    /// The position of the scalar key written as `text`. If there are several,
+    /// such as `1` and `"1"`, the string wins.
+    pub fn find(self: *const Map, text: []const u8) ?usize {
+        if (self.entries.getIndexAdapted(text, TextKey{ .kind = .string })) |i| return i;
+        const kind = resolve(text);
+        if (kind == .string) return null;
+        return self.entries.getIndexAdapted(text, TextKey{ .kind = kind });
+    }
+
     pub fn get(self: *const Map, key: []const u8) ?Value {
-        return self.entries.get(key);
+        return self.entries.values()[self.find(key) orelse return null].value;
     }
 
     pub fn getPtr(self: *Map, key: []const u8) ?*Value {
-        return self.entries.getPtr(key);
+        return &self.entries.values()[self.find(key) orelse return null].value;
+    }
+
+    /// The value under a key of any kind.
+    pub fn getValue(self: *const Map, key: Value) ?Value {
+        return (self.entries.get(key) orelse return null).value;
     }
 
     /// The scalar text under `key` (any kind), or null.
@@ -359,34 +505,42 @@ pub const Map = struct {
         };
     }
 
-    /// Sets `key`, replacing any value (its comments stay). `key` and the
-    /// value's storage must be arena-owned.
+    /// Sets the value under the scalar key written as `key`, keeping that key
+    /// and its comments, or adds `key` as a string. `key` and the value's
+    /// storage must be arena-owned.
     pub fn put(self: *Map, arena: Allocator, key: []const u8, v: Value) Allocator.Error!void {
+        if (self.find(key)) |i| {
+            self.entries.values()[i].value = v;
+        } else try self.putValue(arena, .{ .scalar = .{ .text = key } }, v);
+    }
+
+    /// `put` for a key of any kind.
+    pub fn putValue(self: *Map, arena: Allocator, key: Value, v: Value) Allocator.Error!void {
         const gop = try self.entries.getOrPut(arena, key);
-        if (!gop.found_existing) gop.key_ptr.* = key;
-        gop.value_ptr.* = v;
+        if (gop.found_existing) {
+            gop.value_ptr.value = v;
+        } else gop.value_ptr.* = .{ .value = v };
     }
 
     /// Removes `key` and its comments, keeping the order of the rest.
     pub fn remove(self: *Map, key: []const u8) bool {
-        _ = self.comments.orderedRemove(key);
-        _ = self.key_styles.orderedRemove(key);
+        self.entries.orderedRemoveAt(self.find(key) orelse return false);
+        return true;
+    }
+
+    pub fn removeValue(self: *Map, key: Value) bool {
         return self.entries.orderedRemove(key);
     }
 
     pub fn commentsOf(self: *const Map, key: []const u8) ?Comments {
-        return self.comments.get(key);
+        const c = self.entries.values()[self.find(key) orelse return null].comments;
+        return if (c.isEmpty()) null else c;
     }
 
     /// Sets or (with empty `c`) removes the comments of an existing key. The
     /// strings in `c` must be arena-owned.
-    pub fn setComments(self: *Map, arena: Allocator, key: []const u8, c: Comments) (Allocator.Error || error{ InvalidComment, NotFound })!void {
+    pub fn setComments(self: *Map, key: []const u8, c: Comments) error{ InvalidComment, NotFound }!void {
         try checkComments(c);
-        const own_key = self.entries.getKey(key) orelse return error.NotFound;
-        if (c.isEmpty()) {
-            _ = self.comments.orderedRemove(key);
-            return;
-        }
-        try self.comments.put(arena, own_key, c);
+        self.entries.values()[self.find(key) orelse return error.NotFound].comments = c;
     }
 };

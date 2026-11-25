@@ -285,7 +285,7 @@ fn buildAndEdit(gpa: std.mem.Allocator) !void {
     try doc.set(&.{ "s", "0" }, doc.nullValue());
     try doc.setComments(&.{ "a", "b" }, .{ .before = &.{"# b"}, .after = "# c" });
     try doc.setComments(&.{ "s", "0" }, .{ .after = "# d" });
-    try doc.root.map.noteKeyStyle(doc.allocator(), "s", .double);
+    try doc.root.map.putValue(doc.allocator(), try doc.integer(5), doc.boolean(true));
     const out = try doc.toOwnedString(gpa);
     gpa.free(out);
 }
@@ -394,8 +394,8 @@ fn expectSame(a: yaml.Value, b: yaml.Value) !void {
         .map => |m| {
             try testing.expectEqual(m.count(), b.map.count());
             for (m.entries.keys(), m.entries.values(), b.map.entries.keys(), b.map.entries.values()) |k, x, k2, y| {
-                try testing.expectEqualStrings(k, k2);
-                try expectSame(x, y);
+                try expectSame(k, k2);
+                try expectSame(x.value, y.value);
             }
         },
     }
@@ -769,7 +769,7 @@ test "a flow collection turns into a block one rather than lose anything" {
     defer doc.deinit();
     var inner = try doc.newMap();
     try inner.map.put(doc.allocator(), "deep", doc.boolean(true));
-    try inner.map.setComments(doc.allocator(), "deep", .{ .before = &.{"# keep me"}, .after = "# me too" });
+    try inner.map.setComments("deep", .{ .before = &.{"# keep me"}, .after = "# me too" });
     doc.root.map.getMap("cfg").?.flow = true;
     try doc.set(&.{ "cfg", "x" }, inner);
     try doc.setComments(&.{ "l", "0" }, .{ .before = &.{"# first"} });
@@ -841,12 +841,12 @@ test "Map.setComments needs an existing key and does not keep the caller's" {
     var doc = try parse("a: 1\n");
     defer doc.deinit();
     const map = doc.root.map;
-    try testing.expectError(error.NotFound, map.setComments(doc.allocator(), "later", .{ .after = "# orphan" }));
+    try testing.expectError(error.NotFound, map.setComments("later", .{ .after = "# orphan" }));
     var key = [_]u8{'a'};
-    try map.setComments(doc.allocator(), &key, .{ .after = "# c" });
+    try map.setComments(&key, .{ .after = "# c" });
     key[0] = 'z';
     try testing.expectEqualStrings("# c", map.commentsOf("a").?.after.?);
-    try map.setComments(doc.allocator(), "a", .{});
+    try map.setComments("a", .{});
     try testing.expectEqual(@as(?yaml.Comments, null), map.commentsOf("a"));
 }
 
@@ -987,7 +987,7 @@ test "remove, lookup and set on mappings and sequences" {
     try doc.set(&.{"a"}, try doc.integer(5));
     try doc.set(&.{"c"}, try doc.integer(6));
     try testing.expect(doc.root.map.commentsOf("a") == null);
-    try testing.expect(doc.root.map.key_styles.get("c") == null);
+    try testing.expectEqual(yaml.Style.plain, doc.root.map.keys()[doc.root.map.find("c").?].scalar.style);
 }
 
 test "typed accessors return null for other types" {
@@ -1150,4 +1150,29 @@ test "invalid directives and streams" {
         errdefer std.debug.print("source: {s}\n", .{src});
         try rejectsStream(src, error.Syntax);
     }
+}
+
+test "keys are equal when YAML says they are" {
+    // Different types are different keys.
+    try roundTrips("1: int\n\"1\": string\ntrue: bool\n'true': text\nnull: n\n'null': s\n1.0: float\n");
+    // Different spellings of one value are the same key.
+    for ([_][]const u8{ "1: a\n0x1: b\n", "10: a\n+10: b\n", "true: a\nTrue: b\n", "~: a\nnull: b\n", "1.5: a\n15e-1: b\n", "a: 1\n\"a\": 2\n", "{.nan: 1, .NaN: 2}\n" }) |src| {
+        try rejects(src, error.Syntax);
+    }
+    var doc = try parse("\"1\": string\n1: int\n2: two\n0x1F: hex\n");
+    defer doc.deinit();
+    const m = doc.root.map;
+    try testing.expectEqualStrings("string", m.getString("1").?);
+    try testing.expectEqualStrings("two", m.getString("2").?);
+    try testing.expectEqualStrings("hex", m.getString("0x1F").?);
+    // A text lookup does not read numbers.
+    try testing.expect(m.getString("31") == null);
+    try testing.expectEqualStrings("int", m.getValue(try doc.integer(1)).?.scalar.text);
+    // Putting by text keeps the key that is there; a new one is a string.
+    try m.put(doc.allocator(), "2", try doc.string("zwei"));
+    try m.put(doc.allocator(), "3", try doc.string("drei"));
+    try testing.expect(m.removeValue(try doc.integer(1)));
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("\"1\": string\n2: zwei\n0x1F: hex\n\"3\": drei\n", out);
 }

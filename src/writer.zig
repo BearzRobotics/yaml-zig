@@ -92,11 +92,11 @@ fn checkTree(v: Value, levels: u32) error{ InvalidUtf8, NestingTooDeep }!void {
         },
         .map => |m| {
             if (levels == 0) return error.NestingTooDeep;
-            for (m.entries.keys(), m.entries.values()) |k, item| {
-                try checkText(k);
-                try checkTree(item, levels - 1);
+            for (m.entries.keys(), m.entries.values()) |k, e| {
+                try checkTree(k, levels - 1);
+                try checkTree(e.value, levels - 1);
+                try checkComment(e.comments);
             }
-            for (m.comments.values()) |c| try checkComment(c);
         },
     }
 }
@@ -117,8 +117,10 @@ fn isInline(v: Value) bool {
         .map => |m| {
             if (m.count() == 0) return true;
             if (!m.flow) return false;
-            for (m.entries.values()) |item| if (!isInline(item)) return false;
-            return m.comments.count() == 0;
+            for (m.entries.keys(), m.entries.values()) |k, e| {
+                if (!isInline(k) or !isInline(e.value) or !e.comments.isEmpty()) return false;
+            }
+            return true;
         },
     }
 }
@@ -202,15 +204,15 @@ const Gen = struct {
     // ---- block collections ----------------------------------------------------
 
     fn map(self: *Gen, m: *const Map, indent: usize, first_inline: bool) Error!void {
-        for (m.entries.keys(), m.entries.values(), 0..) |k, v, idx| {
-            const c = m.comments.get(k) orelse Comments{};
+        for (m.entries.keys(), m.entries.values(), 0..) |k, e, idx| {
+            const c = e.comments;
             if (!(first_inline and idx == 0)) {
                 try self.lines(c.before, indent);
                 try self.pad(indent);
             }
-            try self.key(m, k, indent == 0, false);
+            try self.key(k.scalar, indent == 0, false);
             try self.w.writeByte(':');
-            try self.entryValue(v, c.after, indent);
+            try self.entryValue(e.value, c.after, indent);
         }
     }
 
@@ -222,7 +224,7 @@ const Gen = struct {
                 // its own; the mapping then follows in block form below.
                 .map => |m| if (!isInline(item) and c.after == null) {
                     // Comments above the first key sit above the dash.
-                    const first = m.comments.get(m.entries.keys()[0]) orelse Comments{};
+                    const first = m.entries.values()[0].comments;
                     try self.lines(first.before, indent);
                     try self.pad(indent);
                     try self.w.writeAll("- ");
@@ -334,27 +336,13 @@ const Gen = struct {
         self.drop_blank = keep;
     }
 
-    fn key(self: *Gen, m: *const Map, k: []const u8, at_column_0: bool, in_flow: bool) Error!void {
-        const noted = m.key_styles.get(k);
-        switch (noted orelse .plain) {
-            .plain => {
-                // A key added through the API is a string, so it is quoted if
-                // a plain one would read as another type.
-                const typed = model.resolve(k) != .string;
-                // `: value`, an empty plain key.
-                if (noted != null and k.len == 0) return;
-                if ((noted != null or !typed) and keyOk(k, in_flow) and !(at_column_0 and looksLikeMarker(k)))
-                    return self.w.writeAll(k);
-                try self.double(k);
-            },
-            .single => try self.scalarInline(.{ .text = k, .style = .single }, in_flow),
-            else => try self.double(k),
-        }
-    }
-
-    fn keyOk(k: []const u8, in_flow: bool) bool {
-        if (k.len == 0 or !indicatorOk(k) or !plainBody(k)) return false;
-        return !in_flow or std.mem.findAny(u8, k, ",[]{}") == null;
+    /// A scalar key. A key added through the API is a string, so `plainOk`
+    /// has it quoted if plain text would read as another type.
+    fn key(self: *Gen, k: Scalar, at_column_0: bool, in_flow: bool) Error!void {
+        // `: value`, an empty plain key.
+        if (k.style == .plain and k.kind == .null and k.text.len == 0) return;
+        if (at_column_0 and k.style == .plain and looksLikeMarker(k.text)) return self.double(k.text);
+        try self.scalarInline(k, in_flow);
     }
 
     /// A plain scalar cannot start with an indicator, except for `-`, `?` and
@@ -475,11 +463,11 @@ const Gen = struct {
             },
             .map => |m| {
                 try self.w.writeByte('{');
-                for (m.entries.keys(), m.entries.values(), 0..) |k, item, i| {
+                for (m.entries.keys(), m.entries.values(), 0..) |k, e, i| {
                     if (i != 0) try self.w.writeAll(", ");
-                    try self.key(m, k, false, true);
+                    try self.key(k.scalar, false, true);
                     try self.w.writeAll(": ");
-                    try self.flow(item);
+                    try self.flow(e.value);
                 }
                 try self.w.writeByte('}');
             },

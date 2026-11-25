@@ -236,7 +236,7 @@ pub const Document = struct {
         switch (parent) {
             .map => |m| {
                 if (m.get(last) == null) return error.NotFound;
-                try m.setComments(a, last, own);
+                try m.setComments(last, own);
             },
             .seq => |q| q.comments.items[try index(q, last)] = own,
             .scalar => return error.NotACollection,

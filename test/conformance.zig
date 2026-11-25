@@ -204,9 +204,9 @@ fn events(w: *std.Io.Writer, v: yaml.Value) !void {
         },
         .map => |m| {
             try w.print("+MAP{s}\n", .{if (m.flow) " {}" else ""});
-            for (m.entries.keys(), m.entries.values()) |k, item| {
-                try scalarEvent(w, m.key_styles.get(k) orelse .plain, k);
-                try events(w, item);
+            for (m.entries.keys(), m.entries.values()) |k, e| {
+                try events(w, k);
+                try events(w, e.value);
             }
             try w.writeAll("-MAP\n");
         },
@@ -267,7 +267,7 @@ fn same(a: yaml.Value, b: yaml.Value) bool {
         .map => |m| {
             if (b != .map or m.count() != b.map.count()) return false;
             for (m.entries.keys(), m.entries.values(), b.map.entries.keys(), b.map.entries.values()) |k, x, k2, y| {
-                if (!std.mem.eql(u8, k, k2) or !same(x, y)) return false;
+                if (!same(k, k2) or !same(x.value, y.value)) return false;
             }
             return true;
         },

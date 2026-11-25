@@ -527,8 +527,7 @@ const Parser = struct {
     const Key = struct {
         /// The column the key starts in, for diagnostics.
         column: usize,
-        text: []const u8,
-        style: model.Style,
+        value: Value,
         /// What follows the `:` on its line.
         rest: []const u8,
     };
@@ -552,8 +551,7 @@ const Parser = struct {
                     const after = std.mem.trimStart(u8, g.tail, " \t");
                     if (isValueIndicator(after, 0)) return .{ .key = .{
                         .column = self.columnOf(rest),
-                        .text = try self.decodeQuoted(g.quoted),
-                        .style = if (rest[0] == '"') .double else .single,
+                        .value = .{ .scalar = .{ .text = try self.decodeQuoted(g.quoted), .style = if (rest[0] == '"') .double else .single, .kind = .string } },
                         .rest = after[1..],
                     } };
                 }
@@ -576,9 +574,10 @@ const Parser = struct {
             while (i < content.len) : (i += 1) {
                 if (!isValueIndicator(content, i)) continue;
                 // The key may be empty (`: value`).
-                const text = std.mem.trimEnd(u8, content[0..i], " \t");
-                try self.checkPrintable(text);
-                return .{ .key = .{ .column = self.columnOf(rest), .text = try self.a.dupe(u8, text), .style = .plain, .rest = rest[i + 1 ..] } };
+                const found = std.mem.trimEnd(u8, content[0..i], " \t");
+                try self.checkPrintable(found);
+                const text = try self.a.dupe(u8, found);
+                return .{ .key = .{ .column = self.columnOf(rest), .value = .{ .scalar = .{ .text = text, .style = .plain, .kind = model.resolve(text) } }, .rest = rest[i + 1 ..] } };
             }
         }
         return .{ .value = try self.plainScalar(rest, parent) };
@@ -653,7 +652,7 @@ const Parser = struct {
         map.* = .{};
         var key = first_key;
         while (true) {
-            if (map.entries.contains(key.text)) return failAt(self.diag, self.pos + 1, key.column, "duplicate key", error.Syntax);
+            if (map.entries.contains(key.value)) return failAt(self.diag, self.pos + 1, key.column, "duplicate key", error.Syntax);
             var before = try self.takeBefore();
             const rest = std.mem.trimStart(u8, key.rest, " \t");
             var v: Value = undefined;
@@ -681,9 +680,7 @@ const Parser = struct {
                 v = (try self.readNode(rest, @intCast(indent), false)).value;
                 after = self.takeTrailing();
             }
-            try map.entries.put(self.a, key.text, v);
-            try map.noteKeyStyle(self.a, key.text, key.style);
-            if (before.len != 0 or after != null) try map.comments.put(self.a, key.text, .{ .before = before, .after = after });
+            try map.entries.put(self.a, key.value, .{ .value = v, .comments = .{ .before = before, .after = after } });
 
             try self.skipBlank();
             const c = (try self.cur()) orelse break;
@@ -1205,9 +1202,9 @@ const Flow = struct {
             .scalar => |s| s,
             else => return self.p.unsupported("a collection as a key is not supported"),
         };
-        if (m.entries.contains(s.text)) return self.err("duplicate key");
-        try m.entries.put(self.p.a, s.text, value);
-        try m.noteKeyStyle(self.p.a, s.text, s.style);
+        const k: Value = .{ .scalar = s };
+        if (m.entries.contains(k)) return self.err("duplicate key");
+        try m.entries.put(self.p.a, k, .{ .value = value });
     }
 
     /// Consumes the `,` after an entry, or stops before the closing bracket.
@@ -1271,8 +1268,8 @@ fn levelsIn(v: Value) usize {
         .seq => |q| for (q.items.items) |item| {
             deepest = @max(deepest, levelsIn(item));
         },
-        .map => |m| for (m.entries.values()) |item| {
-            deepest = @max(deepest, levelsIn(item));
+        .map => |m| for (m.entries.values()) |e| {
+            deepest = @max(deepest, levelsIn(e.value));
         },
     }
     return 1 + deepest;
