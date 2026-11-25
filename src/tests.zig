@@ -66,6 +66,10 @@ test "scalar kinds follow the core schema and keep their text" {
     try testing.expect(m.get("d").?.scalar.isNull());
     try testing.expect(m.get("e").?.scalar.isNull());
     try testing.expectEqual(yaml.Kind.string, m.get("f").?.scalar.kind);
+    try testing.expectEqualStrings("12", m.getString("f").?);
+    try testing.expectEqual(@as(?i64, null), m.getInt("f"));
+    try testing.expectEqualStrings("x", m.getString("g").?);
+    try testing.expectEqual(yaml.Style.single, m.get("g").?.scalar.style);
     try testing.expectEqual(@as(i64, -3), m.getInt("h").?);
     try testing.expectEqual(@as(f64, 1000), m.getFloat("i").?);
     try testing.expectEqual(yaml.Kind.string, m.get("j").?.scalar.kind); // YAML 1.2: not a boolean
@@ -148,8 +152,14 @@ test "multi-line scalars" {
 test "a sequence may sit at its key's column" {
     var doc = try parse("a:\n- 1\n- 2\nb: x\n");
     defer doc.deinit();
-    try testing.expectEqual(@as(usize, 2), doc.root.map.getSeq("a").?.items.items.len);
+    const items = doc.root.map.getSeq("a").?.items.items;
+    try testing.expectEqual(@as(usize, 2), items.len);
+    try testing.expectEqual(@as(?i64, 1), items[0].scalar.asInt());
+    try testing.expectEqual(@as(?i64, 2), items[1].scalar.asInt());
     try testing.expectEqualStrings("x", doc.root.map.getString("b").?);
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a:\n  - 1\n  - 2\nb: x\n", out);
 }
 
 test "nested sequences and mappings in sequences" {
@@ -159,6 +169,13 @@ test "nested sequences and mappings in sequences" {
     try testing.expectEqual(@as(usize, 3), q.items.items.len);
     try testing.expectEqual(@as(i64, 2), q.items.items[0].map.getInt("b").?);
     try testing.expectEqual(@as(usize, 2), q.items.items[1].seq.items.items.len);
+    try testing.expectEqual(@as(?i64, 1), q.items.items[0].map.getInt("a"));
+    try testing.expectEqualStrings("x", q.items.items[1].seq.items.items[0].scalar.text);
+    try testing.expectEqualStrings("y", q.items.items[1].seq.items.items[1].scalar.text);
+    try testing.expectEqualStrings("plain", q.items.items[2].scalar.text);
+    var back = try writeAndRead(&doc);
+    defer back.deinit();
+    try expectSame(doc.root, back.root);
 }
 
 test "explicit document markers" {
@@ -166,6 +183,9 @@ test "explicit document markers" {
     var doc = try parse("---\na: 1\n...\n");
     defer doc.deinit();
     try testing.expect(doc.explicit_start);
+    try testing.expectEqual(@as(?i64, 1), doc.root.map.getInt("a"));
+    // The optional end marker is not written back.
+    try expectWritten("---\na: 1\n...\n", "---\na: 1\n");
 }
 
 test "editing keeps comments and writes safe scalars" {
@@ -207,6 +227,8 @@ test "strings that need quoting are quoted" {
 test "unsupported and invalid input is rejected" {
     try rejects("a: &x 1\n", error.Unsupported);
     try rejects("a: *x\n", error.Unsupported);
+    try rejects("%YAML 1.2\n---\na: 1\n", error.Unsupported);
+    try rejects("# c\n%TAG ! tag:x,2000:\n--- a\n", error.Unsupported);
     try rejects("a: !!str 1\n", error.Unsupported);
     try rejects("? a\n: b\n", error.Unsupported);
     try rejects("a: 1\n---\nb: 2\n", error.Unsupported);
@@ -241,34 +263,112 @@ test "reading from a reader" {
     try testing.expectEqual(@as(i64, 1), doc.root.map.getInt("a").?);
 }
 
-test "no leaks on allocation failure" {
-    const src = "# c\na: 1 # x\nb:\n  - [1, 2]\n  - k: |\n      text\nc: \"q\"\n";
-    var i: usize = 0;
-    while (i < 200) : (i += 1) {
-        var fa = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = i });
-        if (yaml.Document.parse(fa.allocator(), src, .{}, null)) |*d| {
-            var dd = d.*;
-            const out = dd.toOwnedString(fa.allocator()) catch null;
-            if (out) |o| fa.allocator().free(o);
-            dd.deinit();
+fn parseAndWrite(gpa: std.mem.Allocator, src: []const u8) !void {
+    var doc = try yaml.Document.parse(gpa, src, .{}, null);
+    defer doc.deinit();
+    const out = try doc.toOwnedString(gpa);
+    gpa.free(out);
+}
+
+fn buildAndEdit(gpa: std.mem.Allocator) !void {
+    var doc = try yaml.Document.init(gpa);
+    defer doc.deinit();
+    try doc.set(&.{ "a", "b" }, try doc.string("x\ny\n"));
+    var seq = try doc.newSeq();
+    try seq.seq.append(doc.allocator(), try doc.integer(1));
+    try doc.set(&.{"s"}, seq);
+    try doc.set(&.{ "s", "0" }, doc.nullValue());
+    try doc.setComments(&.{ "a", "b" }, .{ .before = &.{"# b"}, .after = "# c" });
+    try doc.setComments(&.{ "s", "0" }, .{ .after = "# d" });
+    try doc.root.map.noteKeyStyle(doc.allocator(), "s", .double);
+    const out = try doc.toOwnedString(gpa);
+    gpa.free(out);
+}
+
+fn readAll(gpa: std.mem.Allocator) !void {
+    var r: std.Io.Reader = .fixed("a: [1, two]\n");
+    var doc = try yaml.Document.parseReader(gpa, &r, .{}, null);
+    doc.deinit();
+}
+
+// Every allocation is made to fail in turn. Each failure must come back as
+// error.OutOfMemory and leave nothing allocated.
+test "no leaks or swallowed errors on allocation failure" {
+    const sources = [_][]const u8{
+        "# c\na: 1 # x\nb:\n  - [1, 2]\n  - k: |\n      text\nc: \"q\"\n",
+        "--- # s\n'k': [a b\n  c, {\"d\": e}, f: g]\ntrue:\n  # m\n  folded\n  plain # n\nq: >\n  one\n  two\n\nr:\n- - x\n- y: \"multi\n    line\"\n... # o\n",
+        "# root\n[1] # c\n",
+    };
+    for (sources) |src| try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{src});
+    try testing.checkAllAllocationFailures(testing.allocator, buildAndEdit, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, readAll, .{});
+}
+
+test "random bytes never crash the parser" {
+    var prng = std.Random.DefaultPrng.init(12345);
+    const rnd = prng.random();
+    var buf: [256]u8 = undefined;
+    for (0..4000) |_| {
+        const len = rnd.uintLessThan(usize, buf.len);
+        rnd.bytes(buf[0..len]);
+        if (yaml.Document.parse(testing.allocator, buf[0..len], .{}, null)) |*d| {
+            var doc = d.*;
+            defer doc.deinit();
+            var back = try writeAndRead(&doc);
+            back.deinit();
         } else |_| {}
     }
 }
 
-test "random garbage never crashes" {
-    var prng = std.Random.DefaultPrng.init(12345);
+// YAML-6: whatever is accepted is written so that it reads back to the same
+// tree, and writing that again gives the same text. The input is random
+// strings of YAML's own tokens, so that much of it parses.
+test "every accepted input survives writing" {
+    const tokens = [_][]const u8{ "a", "b", ":", " ", " ", " ", "  ", "\n", "\n", "\n", "- ", "-", "#", " # c", "\"", "'", "[", "]", "{", "}", ",", "|", ">", "+", "2", ".", "...", "---", "\\", "\t", "k: ", "x", "\r", "?", "&", "true", "null", "\\n", "|2", ">-", "\n  ", "\n- ", ": ", "\u{85}", "\u{7f}" };
+    var prng = std.Random.DefaultPrng.init(1);
     const rnd = prng.random();
-    const alphabet = "ab: -#\n\t\"'[]{}|>&*!%,.0123\\";
-    var buf: [64]u8 = undefined;
-    var n: usize = 0;
-    while (n < 2000) : (n += 1) {
-        const len = rnd.uintLessThan(usize, buf.len);
-        for (buf[0..len]) |*c| c.* = alphabet[rnd.uintLessThan(usize, alphabet.len)];
-        if (yaml.Document.parse(testing.allocator, buf[0..len], .{}, null)) |*d| {
-            var dd = d.*;
-            if (dd.toOwnedString(testing.allocator)) |o| testing.allocator.free(o) else |_| {}
-            dd.deinit();
-        } else |_| {}
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    var accepted: usize = 0;
+    for (0..40_000) |_| {
+        buf.clearRetainingCapacity();
+        for (0..rnd.uintLessThan(usize, 18)) |_| try buf.appendSlice(testing.allocator, tokens[rnd.uintLessThan(usize, tokens.len)]);
+        var doc = yaml.Document.parse(testing.allocator, buf.items, .{}, null) catch continue;
+        defer doc.deinit();
+        accepted += 1;
+        errdefer std.debug.print("input: \"{f}\"\n", .{std.zig.fmtString(buf.items)});
+        const out = try doc.toOwnedString(testing.allocator);
+        defer testing.allocator.free(out);
+        var back = try parse(out);
+        defer back.deinit();
+        try expectSame(doc.root, back.root);
+        const again = try back.toOwnedString(testing.allocator);
+        defer testing.allocator.free(again);
+        try testing.expectEqualStrings(out, again);
+    }
+    // Guards the test itself: it means nothing if little parses.
+    try testing.expect(accepted > 5_000);
+}
+
+/// Equal values, kinds and key order. Every spelling of null is the same.
+fn expectSame(a: yaml.Value, b: yaml.Value) !void {
+    try testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
+    switch (a) {
+        .scalar => |s| {
+            try testing.expectEqual(s.kind, b.scalar.kind);
+            if (s.kind != .null) try testing.expectEqualStrings(s.text, b.scalar.text);
+        },
+        .seq => |q| {
+            try testing.expectEqual(q.items.items.len, b.seq.items.items.len);
+            for (q.items.items, b.seq.items.items) |x, y| try expectSame(x, y);
+        },
+        .map => |m| {
+            try testing.expectEqual(m.count(), b.map.count());
+            for (m.entries.keys(), m.entries.values(), b.map.entries.keys(), b.map.entries.values()) |k, x, k2, y| {
+                try testing.expectEqualStrings(k, k2);
+                try expectSame(x, y);
+            }
+        },
     }
 }
 
@@ -818,4 +918,75 @@ test "the indentation step comes from nested collections only" {
     var doc = try parse("a:\n   v\nb:\n    c: 1\n");
     defer doc.deinit();
     try testing.expectEqual(@as(u8, 4), doc.indent);
+}
+
+test "remove, lookup and set on mappings and sequences" {
+    var doc = try parse("# a\na: 1 # one\nb: 2\n\"c\": 3\nlist:\n  - x\n  - k: v\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("v", doc.lookup(&.{ "list", "1", "k" }).?.scalar.text);
+    try testing.expectEqualStrings("x", doc.lookup(&.{ "list", "0" }).?.scalar.text);
+    try testing.expect(doc.lookup(&.{ "list", "2" }) == null);
+    try testing.expect(doc.lookup(&.{ "list", "k" }) == null);
+    try testing.expect(doc.lookup(&.{ "a", "b" }) == null);
+    try testing.expect(doc.lookup(&.{"zz"}) == null);
+
+    try doc.set(&.{ "list", "0" }, try doc.string("y"));
+    try doc.set(&.{ "list", "1", "k" }, try doc.string("w"));
+    try testing.expectError(error.NotFound, doc.set(&.{ "list", "2" }, doc.nullValue()));
+    try testing.expectError(error.NotFound, doc.set(&.{ "list", "z" }, doc.nullValue()));
+    try testing.expectError(error.NotACollection, doc.set(&.{ "a", "b" }, doc.nullValue()));
+    try testing.expectError(error.NotACollection, doc.set(&.{ "a", "b", "c" }, doc.nullValue()));
+    try testing.expectError(error.NotFound, doc.setComments(&.{"zz"}, .{}));
+    try testing.expectError(error.NotFound, doc.setComments(&.{ "zz", "a" }, .{}));
+    try testing.expectError(error.NotACollection, doc.setComments(&.{ "a", "b" }, .{}));
+    try doc.setComments(&.{ "list", "1", "k" }, .{ .after = "# deep" });
+
+    try testing.expect(doc.root.map.remove("a"));
+    try testing.expect(doc.root.map.remove("c"));
+    try testing.expect(!doc.root.map.remove("a"));
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("b: 2\nlist:\n  - y\n  - k: w # deep\n", out);
+    // A removed key leaves no comments or key style behind.
+    try doc.set(&.{"a"}, try doc.integer(5));
+    try doc.set(&.{"c"}, try doc.integer(6));
+    try testing.expect(doc.root.map.commentsOf("a") == null);
+    try testing.expect(doc.root.map.key_styles.get("c") == null);
+}
+
+test "typed accessors return null for other types" {
+    var doc = try parse("s: x\nm: {a: 1}\nq: [1]\nb: False\n");
+    defer doc.deinit();
+    const m = doc.root.map;
+    try testing.expectEqual(@as(?bool, false), m.getBool("b"));
+    try testing.expectEqual(@as(?bool, null), m.getBool("s"));
+    try testing.expectEqual(@as(?i64, null), m.getInt("m"));
+    try testing.expectEqual(@as(?f64, null), m.getFloat("q"));
+    try testing.expect(m.getString("m") == null);
+    try testing.expect(m.getMap("q") == null);
+    try testing.expect(m.getSeq("m") == null);
+    try testing.expect(m.getMap("m") != null);
+    try testing.expectEqualStrings("mapping", m.get("m").?.typeName());
+    try testing.expectEqualStrings("sequence", m.get("q").?.typeName());
+    try testing.expectEqualStrings("boolean", m.get("b").?.typeName());
+}
+
+test "reader limits and failures" {
+    var exact: std.Io.Reader = .fixed("a: 1\n");
+    var doc = try yaml.Document.parseReader(testing.allocator, &exact, .{ .max_bytes = 5 }, null);
+    doc.deinit();
+    var failing: std.Io.Reader = .failing;
+    try testing.expectError(error.ReadFailed, yaml.Document.parseReader(testing.allocator, &failing, .{}, null));
+}
+
+test "a large multi-line flow collection" {
+    // Took quadratic time before; at this size that is plainly slow.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "a: [\n");
+    for (0..100_000) |_| try src.appendSlice(testing.allocator, " 1,\n");
+    try src.appendSlice(testing.allocator, " ]\n");
+    var doc = try yaml.Document.parse(testing.allocator, src.items, .{}, null);
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 100_000), doc.root.map.getSeq("a").?.items.items.len);
 }

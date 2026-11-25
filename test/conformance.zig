@@ -13,6 +13,7 @@
 //!   FAIL         anything else: valid input rejected as malformed, a wrong
 //!                value, output that does not read back, or invalid input
 //!                that is accepted
+//!   on purpose   one of `rejected_on_purpose`
 //!
 //! Every failing case is listed, and the step fails if there is one.
 
@@ -22,7 +23,14 @@ const Json = std.json.Value;
 
 const max_file = 1 << 20;
 
-const Outcome = enum { pass, unsupported, rejected_valid, wrong_value, bad_round_trip, accepted_invalid };
+/// Cases where refusing the input is deliberate. The suite checks syntax only;
+/// the specification also requires a mapping's keys to be unique (YAML 1.2.2,
+/// 3.2.1.1), and this library reports a repeat as malformed.
+const rejected_on_purpose = [_]struct { case: []const u8, why: []const u8 }{
+    .{ .case = "2JQS", .why = "two empty keys in one mapping" },
+};
+
+const Outcome = enum { pass, unsupported, on_purpose, rejected_valid, wrong_value, bad_round_trip, accepted_invalid };
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -55,19 +63,30 @@ pub fn main(init: std.process.Init) !void {
         defer arena.deinit();
         var case = try dir.openDir(io, name, .{});
         defer case.close(io);
-        const outcome = try runCase(gpa, arena.allocator(), io, case);
+        var outcome = try runCase(gpa, arena.allocator(), io, case);
+        if (outcome == .rejected_valid) {
+            for (rejected_on_purpose) |known| {
+                if (!std.mem.eql(u8, known.case, name)) continue;
+                outcome = .on_purpose;
+                std.debug.print("on purpose {s}: {s}\n", .{ name, known.why });
+            }
+        }
         counts.getPtr(outcome).* += 1;
-        if (outcome != .pass and outcome != .unsupported) std.debug.print("FAIL {s}: {t}\n", .{ name, outcome });
+        if (isFailure(outcome)) std.debug.print("FAIL {s}: {t}\n", .{ name, outcome });
     }
 
     std.debug.print("{d} cases:", .{names.items.len});
     var failed: usize = 0;
     for (std.enums.values(Outcome)) |o| {
         std.debug.print(" {t}={d}", .{ o, counts.get(o) });
-        if (o != .pass and o != .unsupported) failed += counts.get(o);
+        if (isFailure(o)) failed += counts.get(o);
     }
     std.debug.print("\n", .{});
     if (failed != 0) std.process.exit(1);
+}
+
+fn isFailure(o: Outcome) bool {
+    return o != .pass and o != .unsupported and o != .on_purpose;
 }
 
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
