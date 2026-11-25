@@ -359,29 +359,45 @@ const Parser = struct {
             '&', '*', '!' => return self.unsupported("anchors, aliases and tags are not supported"),
             '@', '`' => return self.err("a reserved indicator cannot start a scalar"),
             '%' => return self.err("a '%' cannot start a plain scalar"),
-            '"', '\'' => return self.quotedScalar(rest),
+            '"', '\'' => return self.quotedScalar(rest, parent),
             '|', '>' => return self.blockScalar(rest, parent),
             '[', '{' => return self.flowValue(rest),
             else => return self.plainScalar(rest, parent),
         }
     }
 
-    fn quotedScalar(self: *Parser, first: []const u8) Error!Value {
-        var text: []const u8 = first;
-        var end = scanQuoted(text);
-        // A quoted scalar may run over several lines.
-        while (end == null) {
+    fn quotedScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
+        // A quoted scalar may run over several lines. They are gathered in one
+        // growable buffer, and the search for the closing quote resumes where
+        // it stopped, so the cost stays linear in the size of the scalar.
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.gpa);
+        try buf.appendSlice(self.gpa, first);
+        var scan: QuoteScan = .{ .quote = first[0] };
+        const end = while (true) {
+            if (scan.find(buf.items)) |e| break e;
             self.pos += 1;
             if (self.pos >= self.lines.len) return self.err("unterminated quoted scalar");
-            text = try std.mem.concat(self.a, u8, &.{ text, "\n", self.lines[self.pos] });
-            end = scanQuoted(text);
-        }
-        const tail = splitComment(text[end.?..]);
+            try self.checkContinuation(self.lines[self.pos], parent);
+            try buf.append(self.gpa, '\n');
+            try buf.appendSlice(self.gpa, self.lines[self.pos]);
+        };
+        const text = try self.a.dupe(u8, buf.items);
+        const tail = splitComment(text[end..]);
         if (std.mem.trim(u8, tail.content, " \t").len != 0) return self.err("unexpected text after a quoted scalar");
         self.trailing = if (tail.comment) |t| try self.a.dupe(u8, t) else null;
         self.pos += 1;
-        const s = try self.decodeQuoted(text[0..end.?]);
+        const s = try self.decodeQuoted(text[0..end]);
         return .{ .scalar = .{ .text = s, .style = if (text[0] == '"') .double else .single, .kind = .string } };
+    }
+
+    /// A further line of a flow scalar or flow collection must be indented
+    /// past the parent (YAML 1.2.2 `s-flow-line-prefix`) and must not be a
+    /// document marker (`c-forbidden`). Blank lines are exempt.
+    fn checkContinuation(self: *Parser, line: []const u8, parent: i64) Error!void {
+        if (isBlank(line)) return;
+        if (isForbidden(line)) return self.err("a document marker cannot appear here");
+        if (@as(i64, @intCast(indentOf(line))) <= parent) return self.err("a continuation line is not indented enough");
     }
 
     fn plainScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
@@ -747,25 +763,39 @@ fn quoteStarts(s: []const u8, i: usize) bool {
     };
 }
 
+/// `---` or `...` at the very start of a line, followed by a blank or nothing
+/// (YAML 1.2.2 `c-forbidden`).
+fn isForbidden(line: []const u8) bool {
+    if (line.len < 3) return false;
+    if (!std.mem.eql(u8, line[0..3], "---") and !std.mem.eql(u8, line[0..3], "...")) return false;
+    return line.len == 3 or line[3] == ' ' or line[3] == '\t';
+}
+
+/// Finds the quote that closes a quoted scalar. `find` may be called again
+/// after more text is appended; it does not rescan what it has seen.
+const QuoteScan = struct {
+    quote: u8,
+    i: usize = 1,
+
+    /// The offset just past the closing quote, or null if `s` does not close it.
+    fn find(self: *QuoteScan, s: []const u8) ?usize {
+        while (self.i < s.len) : (self.i += 1) {
+            const c = s[self.i];
+            if (self.quote == '"' and c == '\\') {
+                self.i += 1;
+            } else if (c == self.quote) {
+                if (self.quote == '\'' and self.i + 1 < s.len and s[self.i + 1] == '\'') {
+                    self.i += 1;
+                } else return self.i + 1;
+            }
+        }
+        return null;
+    }
+};
+
 /// For a string starting with a quote: the offset just past the closing quote,
 /// or null if it is not closed in `s`.
 fn scanQuoted(s: []const u8) ?usize {
-    const q = s[0];
-    var i: usize = 1;
-    while (i < s.len) : (i += 1) {
-        if (q == '"') {
-            if (s[i] == '\\') {
-                i += 1;
-                continue;
-            }
-            if (s[i] == '"') return i + 1;
-        } else if (s[i] == '\'') {
-            if (i + 1 < s.len and s[i + 1] == '\'') {
-                i += 1;
-                continue;
-            }
-            return i + 1;
-        }
-    }
-    return null;
+    var scan: QuoteScan = .{ .quote = s[0] };
+    return scan.find(s);
 }

@@ -271,3 +271,27 @@ test "random garbage never crashes" {
         } else |_| {}
     }
 }
+
+test "a long multi-line quoted scalar uses linear memory" {
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "a: \"\n");
+    for (0..20_000) |_| try src.appendSlice(testing.allocator, " x\n");
+    try src.appendSlice(testing.allocator, " \"\n");
+    var doc = try yaml.Document.parse(testing.allocator, src.items, .{}, null);
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 40_001), doc.root.map.getString("a").?.len);
+    // The quadratic version held hundreds of megabytes here.
+    try testing.expect(doc.arena.queryCapacity() < 16 * src.items.len);
+}
+
+test "continuation lines of a quoted scalar are checked" {
+    try rejects("a: \"b\nc\"\n", error.Syntax);
+    try rejects("a: \"bar\n\tbaz\"\n", error.Syntax);
+    try rejects("---\n\"\n---\n\"\n", error.Syntax);
+    try rejects("---\n'\n...\n'\n", error.Syntax);
+    var doc = try parse("a: \"b\n\n  --- c\"\nd: 'e\\\n f'\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("b\n--- c", doc.root.map.getString("a").?);
+    try testing.expectEqualStrings("e\\ f", doc.root.map.getString("d").?);
+}
