@@ -308,6 +308,7 @@ test "no leaks or swallowed errors on allocation failure" {
     try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{@as([]const u8, "a: &a [1, *a, &b x]\nb: *b\n&c key: &d\n  *c : *d\n")});
     try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{@as([]const u8, "? [a, {b: c}]\n# x\n: - d\n? |\n  e\n: f\n{g: h}: i\n")});
     try testing.checkAllAllocationFailures(testing.allocator, buildAndEdit, .{});
+    try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{@as([]const u8, "a\x00:\x00 \x00[\x001\x00]\x00\n\x00")});
     try testing.checkAllAllocationFailures(testing.allocator, readAll, .{});
 }
 
@@ -1628,4 +1629,68 @@ test "a stream keeps documents apart however they were changed" {
     const with_directives = try ended.toOwnedString(testing.allocator);
     defer testing.allocator.free(with_directives);
     try testing.expectEqualStrings("x\n...\n%YAML 1.2\n---\ny\n", with_directives);
+}
+
+/// `text` (ASCII or UTF-8) in UTF-16 or UTF-32.
+fn encode(comptime Unit: type, endian: std.builtin.Endian, bom: bool, text: []const u8) !std.ArrayList(u8) {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    var points = (try std.unicode.Utf8View.init(text)).iterator();
+    var first = bom;
+    while (true) {
+        const c: u21 = if (first) 0xFEFF else points.nextCodepoint() orelse break;
+        first = false;
+        var units: [2]u32 = .{ c, 0 };
+        var count: usize = 1;
+        if (Unit == u16 and c > 0xFFFF) {
+            units = .{ 0xD800 + ((c - 0x10000) >> 10), 0xDC00 + ((c - 0x10000) & 0x3FF) };
+            count = 2;
+        }
+        for (units[0..count]) |u| {
+            var bytes: [@sizeOf(Unit)]u8 = undefined;
+            std.mem.writeInt(Unit, &bytes, @intCast(u), endian);
+            try out.appendSlice(testing.allocator, &bytes);
+        }
+    }
+    return out;
+}
+
+test "UTF-16 and UTF-32 input" {
+    const text = "a: caf\u{e9} \u{1F600}\nb: [1]\n";
+    inline for (.{ u16, u32 }) |Unit| {
+        for ([_]std.builtin.Endian{ .little, .big }) |endian| {
+            for ([_]bool{ true, false }) |bom| {
+                var src = try encode(Unit, endian, bom, text);
+                defer src.deinit(testing.allocator);
+                var doc = try yaml.Document.parse(testing.allocator, src.items, .{}, null);
+                defer doc.deinit();
+                // The text is kept, and written as UTF-8.
+                try testing.expectEqualStrings("caf\u{e9} \u{1F600}", doc.root.map.getString("a").?);
+                const out = try doc.toOwnedString(testing.allocator);
+                defer testing.allocator.free(out);
+                try testing.expectEqualStrings(text, out);
+                // Half a code unit is not text.
+                try rejects(src.items[0 .. src.items.len - 1], error.InvalidUtf8);
+            }
+        }
+    }
+    try rejects("\xFF\xFEa\x00\x00\xD8", error.InvalidUtf8); // a lone surrogate
+    try rejects("\xFF\xFEa\x00\x00\xDC", error.InvalidUtf8);
+    try rejects("\x00\x00\xFE\xFF\x00\x11\x00\x00", error.InvalidUtf8); // past U+10FFFF
+}
+
+test "a byte order mark may not stand inside a document" {
+    for ([_][]const u8{ "- a\n\u{feff}\n- b\n", "a: x\u{feff}\n", "a: 1 # \u{feff}\n", "k\u{feff}: 1\n", "a: [\u{feff}]\n", "a: |\n  \u{feff}\n" }) |src| {
+        errdefer std.debug.print("source: {f}\n", .{std.zig.fmtString(src)});
+        try rejects(src, error.Syntax);
+    }
+    // Inside quotes it is allowed, and written as an escape.
+    try expectWritten("a: \"\u{feff}\"\n", "a: \"\\uFEFF\"\n");
+    var doc = try parse("a: 1\n");
+    defer doc.deinit();
+    try testing.expectError(error.InvalidComment, doc.setComments(&.{"a"}, .{ .after = "# \u{feff}" }));
+    try doc.set(&.{"a"}, try doc.string("x\u{feff}\ny\n"));
+    var back = try writeAndRead(&doc);
+    defer back.deinit();
+    try testing.expectEqualStrings("x\u{feff}\ny\n", back.root.map.getString("a").?);
 }

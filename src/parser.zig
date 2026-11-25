@@ -89,12 +89,20 @@ const null_scalar: Value = .{ .scalar = .{ .text = "", .style = .plain, .kind = 
 pub const Reader = struct {
     parser: Parser,
     lines: std.ArrayList([]const u8),
+    /// The source as UTF-8, if it came in another encoding; the lines are in it.
+    decoded: ?[]u8 = null,
 
-    /// `source` must stay as it is while the reader is used.
+    /// `source` must stay as it is while the reader is used. It may be UTF-8,
+    /// UTF-16 or UTF-32 (YAML 1.2.2, 5.2).
     pub fn init(gpa: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) Error!Reader {
         if (source.len > options.max_bytes) return failAt(diag, 1, 1, "input too large", error.LimitExceeded);
-        if (!std.unicode.utf8ValidateSlice(source)) return failAt(diag, 1, 1, "invalid UTF-8", error.InvalidUtf8);
-        var text = source;
+        const decoded: ?[]u8 = if (detectEncoding(source)) |encoding|
+            try decode(gpa, source, encoding) orelse return failAt(diag, 1, 1, "invalid UTF-16 or UTF-32", error.InvalidUtf8)
+        else
+            null;
+        errdefer if (decoded) |d| gpa.free(d);
+        var text: []const u8 = decoded orelse source;
+        if (decoded == null and !std.unicode.utf8ValidateSlice(text)) return failAt(diag, 1, 1, "invalid UTF-8", error.InvalidUtf8);
         if (std.mem.startsWith(u8, text, byte_order_mark)) text = text[byte_order_mark.len..];
 
         var lines: std.ArrayList([]const u8) = .empty;
@@ -115,6 +123,7 @@ pub const Reader = struct {
         return .{
             .parser = .{ .a = undefined, .gpa = gpa, .lines = lines.items, .unterminated = unterminated, .options = options, .diag = diag },
             .lines = lines,
+            .decoded = decoded,
         };
     }
 
@@ -122,6 +131,7 @@ pub const Reader = struct {
         self.parser.pending.deinit(self.parser.gpa);
         self.parser.scratch.deinit(self.parser.gpa);
         self.lines.deinit(self.parser.gpa);
+        if (self.decoded) |d| self.parser.gpa.free(d);
     }
 
     /// The next document, allocated in `arena`, or null at the end of the
@@ -140,6 +150,54 @@ pub const Reader = struct {
 };
 
 const byte_order_mark = "\xEF\xBB\xBF";
+
+const Encoding = struct { unit: u3, endian: std.builtin.Endian };
+
+/// The encoding of a stream that is not UTF-8, from its first bytes: a byte
+/// order mark, or the zero bytes around a first ASCII character (the table in
+/// YAML 1.2.2, 5.2).
+fn detectEncoding(s: []const u8) ?Encoding {
+    if (s.len >= 4) {
+        if (s[0] == 0 and s[1] == 0 and ((s[2] == 0xFE and s[3] == 0xFF) or s[2] == 0)) return .{ .unit = 4, .endian = .big };
+        if (s[0] == 0xFF and s[1] == 0xFE and s[2] == 0 and s[3] == 0) return .{ .unit = 4, .endian = .little };
+        if (s[1] == 0 and s[2] == 0 and s[3] == 0) return .{ .unit = 4, .endian = .little };
+    }
+    if (s.len >= 2) {
+        if ((s[0] == 0xFE and s[1] == 0xFF) or s[0] == 0) return .{ .unit = 2, .endian = .big };
+        if ((s[0] == 0xFF and s[1] == 0xFE) or s[1] == 0) return .{ .unit = 2, .endian = .little };
+    }
+    return null;
+}
+
+/// `s` as UTF-8, or null if it is not whole, valid text in `encoding`. A byte
+/// order mark stays, as the character it is.
+fn decode(gpa: Allocator, s: []const u8, encoding: Encoding) Allocator.Error!?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    if (s.len % encoding.unit != 0) return null;
+    var i: usize = 0;
+    while (i < s.len) {
+        var c: u32 = if (encoding.unit == 4)
+            std.mem.readInt(u32, s[i..][0..4], encoding.endian)
+        else
+            std.mem.readInt(u16, s[i..][0..2], encoding.endian);
+        i += encoding.unit;
+        if (encoding.unit == 2 and c >= 0xD800 and c <= 0xDBFF) {
+            // The first half of a surrogate pair.
+            if (i >= s.len) return null;
+            const low: u32 = std.mem.readInt(u16, s[i..][0..2], encoding.endian);
+            if (low < 0xDC00 or low > 0xDFFF) return null;
+            c = 0x10000 + ((c - 0xD800) << 10) + (low - 0xDC00);
+            i += 2;
+        }
+        if (c > 0x10FFFF) return null;
+        var buffer: [4]u8 = undefined;
+        // This refuses a surrogate on its own.
+        const len = std.unicode.utf8Encode(@intCast(c), &buffer) catch return null;
+        try out.appendSlice(gpa, buffer[0..len]);
+    }
+    return try out.toOwnedSlice(gpa);
+}
 
 /// Reads a stream that holds at most one document.
 pub fn parse(gpa: Allocator, arena: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) Error!Result {
@@ -268,9 +326,10 @@ const Parser = struct {
     }
 
     /// Quoted scalars may hold any character that is not a C0 control; all
-    /// other text must be printable.
+    /// other text must be printable, and may not hold a byte order mark.
     fn checkPrintable(self: *Parser, text: []const u8) Error!void {
         if (model.findNonPrintable(text) != null) return self.err("non-printable character outside a quoted scalar");
+        if (std.mem.indexOf(u8, text, byte_order_mark) != null) return self.err("a byte order mark inside a document");
     }
 
     fn keepComment(self: *Parser, text: []const u8) Error![]const u8 {

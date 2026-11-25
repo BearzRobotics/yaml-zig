@@ -468,6 +468,8 @@ pub fn checkComments(c: Comments) error{InvalidComment}!void {
 fn checkLine(l: []const u8) error{InvalidComment}!void {
     if (l.len == 0 or l[0] != '#') return error.InvalidComment;
     if (!std.unicode.utf8ValidateSlice(l) or findNonPrintable(l) != null) return error.InvalidComment;
+    // A byte order mark may not stand inside a document.
+    if (std.mem.indexOf(u8, l, "\u{feff}") != null) return error.InvalidComment;
 }
 
 pub const Seq = struct {

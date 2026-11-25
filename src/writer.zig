@@ -423,7 +423,7 @@ const Gen = struct {
 
     /// A block scalar holds text without control characters (apart from tab and newline).
     fn blockOk(text: []const u8) bool {
-        if (!std.unicode.utf8ValidateSlice(text)) return false;
+        if (!std.unicode.utf8ValidateSlice(text) or std.mem.indexOf(u8, text, "\u{feff}") != null) return false;
         var lines_of = std.mem.splitScalar(u8, text, '\n');
         while (lines_of.next()) |l| if (model.findNonPrintable(l) != null) return false;
         return true;
