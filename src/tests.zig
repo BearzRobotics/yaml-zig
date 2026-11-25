@@ -1608,3 +1608,24 @@ test "equal keys are duplicates through aliases, and unequal ones are not" {
     defer doc.deinit();
     try testing.expectEqual(@as(usize, 2), doc.root.map.getMap("m").?.count());
 }
+
+// Parsed documents carry the markers they need; ones changed through the API
+// may not, and must be kept apart all the same.
+test "a stream keeps documents apart however they were changed" {
+    var stream = try parseStream("a: 1\n---\nb: 2\n---\n\"c\"\n");
+    defer stream.deinit();
+    for (stream.documents) |*d| d.explicit_start = false;
+    std.mem.swap(yaml.Document, &stream.documents[0], &stream.documents[2]);
+    const out = try stream.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("\"c\"\n---\nb: 2\n---\na: 1\n", out);
+
+    // After '...' a document needs no '---', unless it has directives.
+    var ended = try parseStream("x\n...\ny\n");
+    defer ended.deinit();
+    ended.documents[1].directives = &.{"%YAML 1.2"};
+    ended.documents[0].explicit_end = false;
+    const with_directives = try ended.toOwnedString(testing.allocator);
+    defer testing.allocator.free(with_directives);
+    try testing.expectEqualStrings("x\n...\n%YAML 1.2\n---\ny\n", with_directives);
+}
