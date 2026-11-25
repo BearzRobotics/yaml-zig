@@ -752,16 +752,21 @@ const Parser = struct {
             },
             .alias => return self.err("an alias cannot have properties"),
         }
-        if (props.anchor) |a| {
-            a.value = v.*;
-            a.complete = true;
-        }
+        if (props.anchor) |a| model.sealAnchor(a, v.*);
     }
 
     /// A key's hash is taken as it goes in, so what it refers to must be whole.
     fn checkKey(self: *Parser, key: Value, column: usize) Error!void {
         if (holdsOpenAlias(key, null))
             return failAt(self.diag, self.pos + 1, column, "a key cannot hold an alias of a node that holds the key", error.Unsupported);
+    }
+
+    /// Refuses `key` if `map` has it already, reporting it at `line`.
+    fn checkNewKey(self: *Parser, map: *const Map, key: Value, line: usize, column: usize) Error!void {
+        const i = map.entries.getIndex(key) orelse return;
+        if (model.compareKeys(map.entries.keys()[i], key) == .too_large)
+            return failAt(self.diag, line, column, "mapping keys too large to compare", error.LimitExceeded);
+        return failAt(self.diag, line, column, "duplicate key", error.Syntax);
     }
 
     /// The anchored nodes of a key that the walk through it is inside.
@@ -1001,7 +1006,7 @@ const Parser = struct {
         while (true) {
             if (implicit) |key| {
                 try self.checkKey(key.value, key.column);
-                if (map.entries.contains(key.value)) return failAt(self.diag, self.pos + 1, key.column, "duplicate key", error.Syntax);
+                try self.checkNewKey(map, key.value, self.pos + 1, key.column);
                 const before = try self.takeBefore();
                 const entry = try self.implicitValue(indent, key, before);
                 try addEntry(self.a, map, key.value, entry.value, entry.comments);
@@ -1028,7 +1033,7 @@ const Parser = struct {
         const key_line = self.pos;
         const key = try self.indented(indent, try self.takeBefore(), true);
         try self.checkKey(key.value, indent + 1);
-        if (map.entries.contains(key.value)) return failAt(self.diag, key_line + 1, indent + 1, "duplicate key", error.Syntax);
+        try self.checkNewKey(map, key.value, key_line + 1, indent + 1);
 
         try self.skipBlank();
         const next = try self.cur();
@@ -1616,7 +1621,7 @@ const Flow = struct {
 
     fn put(self: *Flow, m: *Map, key: Value, value: Value) Error!void {
         try self.p.checkKey(key, self.i + 1);
-        if (m.entries.contains(key)) return self.err("duplicate key");
+        try self.p.checkNewKey(m, key, self.p.pos + 1, self.i + 1);
         try m.putValue(self.p.a, key, value);
     }
 

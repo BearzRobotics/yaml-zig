@@ -1573,3 +1573,38 @@ test "comments on a property line, and runs of empty lines, are stable" {
     try expectStable("!t # on the tag\n# above a\na: 1\n", "!t\n# on the tag\n# above a\na: 1\n");
     try expectStable(" # c3\n\n- \n    \n  j: &a \n", "# c3\n\n- j: &a\n");
 }
+
+test "maps keyed by aliases cannot make comparing keys take forever" {
+    // Two equal towers of maps, each level using the one below as both its
+    // key and its value. Compared naively, the work doubles with each level.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    for ([_][]const u8{ "p", "q" }) |side| {
+        try src.print(testing.allocator, "{s}0: &{s}k0 {{a: 1}}\n{s}v0: &{s}v0 {{b: 1}}\n", .{ side, side, side, side });
+        for (1..60) |i| try src.print(testing.allocator, "{s}{d}: &{s}k{d} {{*{s}k{d} : *{s}v{d} }}\n{s}v{d}: &{s}v{d} {{*{s}v{d} : *{s}k{d} }}\n", .{ side, i, side, i, side, i - 1, side, i - 1, side, i, side, i, side, i - 1, side, i - 1 });
+    }
+    try src.appendSlice(testing.allocator, "*pk59 : 1\n*qk59 : 2\n");
+    try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, src.items, .{}, null));
+}
+
+test "a long chain of aliases does not overflow the stack" {
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "- &c0 [x]\n- &d0 [x]\n");
+    for (1..100_000) |i| try src.print(testing.allocator, "- &c{d} [*c{d}]\n- &d{d} [*d{d}]\n", .{ i, i - 1, i, i - 1 });
+    const chains = src.items.len;
+    try src.appendSlice(testing.allocator, "- {*c99999 : v}\n");
+    var doc = try yaml.Document.parse(testing.allocator, src.items, .{}, null);
+    doc.deinit();
+    // Two equal chains as keys are too deep to tell apart.
+    src.shrinkRetainingCapacity(chains);
+    try src.appendSlice(testing.allocator, "- {*c99999 : 1, *d99999 : 2}\n");
+    try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, src.items, .{}, null));
+}
+
+test "equal keys are duplicates through aliases, and unequal ones are not" {
+    try rejects("a: &a {x: 1, y: [2]}\nm: {*a : 1, ? {y: [2], x: 1} : 2}\n", error.Syntax);
+    var doc = try parse("a: &a {x: 1, y: [2]}\nm: {*a : 1, ? {y: [3], x: 1} : 2}\n");
+    defer doc.deinit();
+    try testing.expectEqual(@as(usize, 2), doc.root.map.getMap("m").?.count());
+}

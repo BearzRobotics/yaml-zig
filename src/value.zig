@@ -167,7 +167,7 @@ pub const Anchor = struct {
     value: Value,
     /// False only while the parser is still inside the node.
     complete: bool = true,
-    /// The node's hash as a key, once something has needed it.
+    /// The node's hash as a key.
     hash: ?u64 = null,
 };
 
@@ -228,8 +228,7 @@ pub fn replaceNode(slot: *Value, new: Value) void {
         // The anchored node is gone; writing will say so if it is still used.
         .alias => return,
     }
-    a.value = slot.*;
-    a.hash = null;
+    sealAnchor(a, slot.*);
 }
 
 /// Comments on one item: the lines above it (each `#...`, or empty for a blank
@@ -492,18 +491,34 @@ pub const Seq = struct {
 /// string.
 pub const KeyContext = struct {
     pub fn hash(_: KeyContext, key: Value) u32 {
-        var budget: usize = compare_budget;
-        return @truncate(nodeHash(key, &budget));
+        return @truncate(nodeHash(key, 0));
     }
 
     pub fn eql(_: KeyContext, a: Value, b: Value, _: usize) bool {
-        var budget: usize = compare_budget;
-        return sameKey(a, b, &budget);
+        // Keys that are too large to compare count as the same, so that no
+        // more of them are compared. The parser reports it as what it is.
+        return compareKeys(a, b) != .different;
     }
 };
 
-/// How many nodes comparing two keys may visit.
-const compare_budget: usize = 1 << 16;
+pub const Comparison = enum { same, different, too_large };
+
+/// Compares two keys, following aliases as far as the limits allow.
+pub fn compareKeys(a: Value, b: Value) Comparison {
+    var work: Work = .{};
+    return compare(a, b, &work);
+}
+
+/// What one comparison of keys may cost. Aliases let a small text stand for
+/// an enormous tree, or for one that never ends, so every step of a comparison
+/// draws on the same allowance.
+const Work = struct {
+    steps: usize = 1 << 16,
+    depth: u32 = 0,
+};
+
+/// How deep hashing and comparing keys go, through aliases or not.
+const max_key_depth = 128;
 
 /// The tag that decides what a scalar is: its own, or the one the core schema
 /// gives it.
@@ -546,32 +561,48 @@ fn hashScalar(h: *std.hash.Wyhash, tag: []const u8, content: []const u8) void {
     h.update(content);
 }
 
+/// Stands for what hashing does not go into.
+const unhashed: u64 = 0x9e37_79b9_7f4a_7c15;
+
 /// The hash of a node, or of the node an alias stands for. It does not depend
-/// on whether the node has an anchor, but an anchored node's is computed once,
-/// so that many keys that alias one large node cost no more than one.
-fn nodeHash(v: Value, budget: *usize) u64 {
-    const anchor = (if (v == .alias) v.alias else v.anchorOf()) orelse return freshHash(v, budget);
-    if (anchor.hash) |known| return known;
-    // A node that holds itself finds this while it is being hashed.
-    anchor.hash = 0;
-    anchor.hash = freshHash(v.deref(), budget);
-    return anchor.hash.?;
+/// on whether the node has an anchor. An anchored node's is computed once,
+/// when it is complete (`sealAnchor`): an alias then costs nothing to hash,
+/// however much it stands for, and hashing does not follow chains of aliases.
+fn nodeHash(v: Value, depth: u32) u64 {
+    if (v == .alias) {
+        const a = v.alias;
+        // Inside the node it refers to.
+        if (!a.complete) return unhashed;
+        return a.hash orelse freshHash(a.value, depth);
+    }
+    if (v.anchorOf()) |a| {
+        if (a.hash) |known| return known;
+    }
+    return freshHash(v, depth);
 }
 
-fn freshHash(v: Value, budget: *usize) u64 {
-    var h = std.hash.Wyhash.init(0);
-    hashNode(&h, v, budget);
+fn freshHash(v: Value, depth: u32) u64 {
+    if (depth >= max_key_depth) return unhashed;
+    var h = std.hash.Wyhash.init(2);
+    hashNode(&h, v, depth);
     return h.final();
 }
 
-fn hashValue(h: *std.hash.Wyhash, v: Value, budget: *usize) void {
-    const part = nodeHash(v, budget);
+fn hashPart(h: *std.hash.Wyhash, v: Value, depth: u32) void {
+    const part = nodeHash(v, depth + 1);
     h.update(std.mem.asBytes(&part));
 }
 
-fn hashNode(h: *std.hash.Wyhash, v: Value, budget: *usize) void {
-    if (budget.* == 0) return;
-    budget.* -= 1;
+/// Finishes an anchor whose node has been read whole. Anchors inside the node
+/// are finished before it.
+pub fn sealAnchor(a: *Anchor, node: Value) void {
+    a.value = node;
+    a.hash = null;
+    a.complete = true;
+    a.hash = freshHash(node, 0);
+}
+
+fn hashNode(h: *std.hash.Wyhash, v: Value, depth: u32) void {
     switch (v) {
         .alias => unreachable,
         .scalar => |s| {
@@ -580,15 +611,15 @@ fn hashNode(h: *std.hash.Wyhash, v: Value, budget: *usize) void {
         },
         .seq => |q| {
             h.update("[");
-            for (q.items.items) |item| hashValue(h, item, budget);
+            for (q.items.items) |item| hashPart(h, item, depth);
         },
         .map => |m| {
             // The order of a mapping's keys is not part of its value.
             var sum: u64 = 0;
             for (m.entries.keys(), m.entries.values()) |k, e| {
                 var one = std.hash.Wyhash.init(1);
-                hashValue(&one, k, budget);
-                hashValue(&one, e.value, budget);
+                hashPart(&one, k, depth);
+                hashPart(&one, e.value, depth);
                 sum +%= one.final();
             }
             h.update("{");
@@ -597,35 +628,52 @@ fn hashNode(h: *std.hash.Wyhash, v: Value, budget: *usize) void {
     }
 }
 
-fn sameKey(x_in: Value, y_in: Value, budget: *usize) bool {
-    if (x_in == .alias and y_in == .alias and x_in.alias == y_in.alias) return true;
-    if (budget.* == 0) return false;
-    budget.* -= 1;
-    const a = x_in.deref();
-    const b = y_in.deref();
-    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+fn compare(x: Value, y: Value, work: *Work) Comparison {
+    if (x == .alias and y == .alias and x.alias == y.alias) return .same;
+    if (work.steps == 0 or work.depth >= max_key_depth) return .too_large;
+    work.steps -= 1;
+    work.depth += 1;
+    defer work.depth -= 1;
+    const a = x.deref();
+    const b = y.deref();
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return .different;
     switch (a) {
         .alias => unreachable,
         .scalar => |s| {
-            if (!std.mem.eql(u8, effectiveTag(s), effectiveTag(b.scalar))) return false;
-            var x: [64]u8 = undefined;
-            var y: [64]u8 = undefined;
-            return std.mem.eql(u8, canonical(s, &x), canonical(b.scalar, &y));
+            if (!std.mem.eql(u8, effectiveTag(s), effectiveTag(b.scalar))) return .different;
+            var first: [64]u8 = undefined;
+            var second: [64]u8 = undefined;
+            return if (std.mem.eql(u8, canonical(s, &first), canonical(b.scalar, &second))) .same else .different;
         },
         .seq => |q| {
-            if (q == b.seq) return true;
-            if (!sameTag(q.tag, b.seq.tag) or q.items.items.len != b.seq.items.items.len) return false;
-            for (q.items.items, b.seq.items.items) |i, j| if (!sameKey(i, j, budget)) return false;
-            return true;
+            if (q == b.seq) return .same;
+            if (!sameTag(q.tag, b.seq.tag) or q.items.items.len != b.seq.items.items.len) return .different;
+            for (q.items.items, b.seq.items.items) |i, j| {
+                const result = compare(i, j, work);
+                if (result != .same) return result;
+            }
+            return .same;
         },
         .map => |m| {
-            if (m == b.map) return true;
-            if (!sameTag(m.tag, b.map.tag) or m.count() != b.map.count()) return false;
-            for (m.entries.keys(), m.entries.values()) |k, e| {
-                const other = b.map.entries.get(k) orelse return false;
-                if (!sameKey(e.value, other.value, budget)) return false;
+            if (m == b.map) return .same;
+            if (!sameTag(m.tag, b.map.tag) or m.count() != b.map.count()) return .different;
+            // Not through the other map's index, whose lookups would each
+            // start with a fresh allowance. Equal maps are mostly written in
+            // one order, so each search starts at the same position.
+            const keys = b.map.entries.keys();
+            for (m.entries.keys(), m.entries.values(), 0..) |k, e, i| {
+                var j = i;
+                const found = for (0..keys.len) |_| {
+                    switch (compare(k, keys[j], work)) {
+                        .same => break j,
+                        .too_large => return .too_large,
+                        .different => j = if (j + 1 == keys.len) 0 else j + 1,
+                    }
+                } else return .different;
+                const result = compare(e.value, b.map.entries.values()[found].value, work);
+                if (result != .same) return result;
             }
-            return true;
+            return .same;
         },
     }
 }
@@ -645,8 +693,7 @@ const TextKey = struct {
     // A key with a tag of its own is found by text only through `find`'s scan.
     pub fn hash(self: TextKey, text: []const u8) u32 {
         const s: Scalar = .{ .text = text, .kind = self.kind };
-        var budget: usize = compare_budget;
-        return @truncate(freshHash(.{ .scalar = s }, &budget));
+        return @truncate(freshHash(.{ .scalar = s }, 0));
     }
 
     pub fn eql(self: TextKey, text: []const u8, key: Value, _: usize) bool {
@@ -696,7 +743,7 @@ pub const Map = struct {
         if (self.odd_keys) {
             for (self.entries.keys(), 0..) |k, i| {
                 const node = k.deref();
-                if (node == .scalar and node.scalar.tag != null and std.mem.eql(u8, node.scalar.text, text)) return i;
+                if (node == .scalar and (node.scalar.tag != null or k == .alias) and std.mem.eql(u8, node.scalar.text, text)) return i;
             }
         }
         return null;
@@ -771,7 +818,8 @@ pub const Map = struct {
     /// `put` for a key of any kind.
     pub fn putValue(self: *Map, arena: Allocator, key: Value, v: Value) Allocator.Error!void {
         const node = key.deref();
-        if (node == .scalar and node.scalar.tag != null) self.odd_keys = true;
+        // The text of an alias key can change after its hash was taken.
+        if (node == .scalar and (node.scalar.tag != null or key == .alias)) self.odd_keys = true;
         const gop = try self.entries.getOrPut(arena, key);
         if (gop.found_existing) {
             replaceNode(&gop.value_ptr.value, v);

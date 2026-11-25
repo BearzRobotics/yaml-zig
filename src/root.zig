@@ -165,6 +165,7 @@ pub const Document = struct {
             .alias => unreachable,
         }
         a.* = .{ .name = owned, .value = v.* };
+        @import("value.zig").sealAnchor(a, v.*);
         return a;
     }
 
