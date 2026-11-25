@@ -21,7 +21,14 @@ Reference: the YAML 1.2.2 specification, https://yaml.org/spec/1.2.2/ (source: h
 - **Not read** (reported as `error.Unsupported`): anchors, aliases, tags, directives, complex keys (`? ` or a collection as a key), several documents in one stream.
 - **Write:** block style with the source's indentation step; scalars and keys keep their style; strings and keys added through the API are quoted when they would otherwise read as something else. Folded scalars are written as literal (same value). Comments inside flow collections are dropped, except that the last moves after the closing bracket. `write` refuses what could not be read back (`error.InvalidUtf8`, `error.NestingTooDeep`).
 
-`zig build test` runs the tests. `zig build conformance -Dsuite=PATH` runs the official [yaml-test-suite](https://github.com/yaml/yaml-test-suite): at `data-2022-01-17` there are no failures, with 109 of its 402 cases using features that are not read. See `ai/SPEC.md` for the details and the one deliberate departure from YAML 1.2.2.
+`zig build test` runs the tests. To run the official [yaml-test-suite](https://github.com/yaml/yaml-test-suite), which is not part of this repository:
+
+```sh
+scripts/fetch-conformance.sh                    # once; into conformance-suite/, ignored by git
+zig build conformance -Dsuite=conformance-suite
+```
+
+At `data-2022-01-17` there are no failures, with 109 of its 402 cases using features that are not read. See `ai/SPEC.md` for the details and the one deliberate departure from YAML 1.2.2.
 
 ## Changes in 0.2.0
 

@@ -1,8 +1,8 @@
 //! Runs the official YAML test suite, https://github.com/yaml/yaml-test-suite,
 //! which is not vendored:
 //!
-//!   git clone https://github.com/yaml/yaml-test-suite -b data-2022-01-17 SUITE
-//!   zig build conformance -Dsuite=SUITE
+//!   scripts/fetch-conformance.sh
+//!   zig build conformance -Dsuite=conformance-suite
 //!
 //! yaml-zig reads a documented subset of YAML, so each case lands in one of
 //! these groups:

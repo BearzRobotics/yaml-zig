@@ -19,7 +19,7 @@ Read YAML (notably Solus `package.yml`) and write it back without losing comment
 
 ## Conformance
 
-`zig build conformance -Dsuite=PATH` runs the official suite, https://github.com/yaml/yaml-test-suite (not vendored; see `test/conformance.zig`). At tag `data-2022-01-17`, of 402 cases:
+`scripts/fetch-conformance.sh` downloads the official suite, https://github.com/yaml/yaml-test-suite (not vendored), and `zig build conformance -Dsuite=conformance-suite` runs it (see `test/conformance.zig`). At tag `data-2022-01-17`, of 402 cases:
 
 | Result | Cases |
 |---|---:|
