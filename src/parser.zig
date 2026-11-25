@@ -100,6 +100,9 @@ const Cur = struct {
     indent: usize,
     /// The line after its indent, without a trailing comment, right-trimmed.
     content: []const u8,
+    /// Tabs separate the indent from the content. Such a line may hold a scalar
+    /// or a flow collection, but no block structure: tabs do not indent.
+    tabbed: bool = false,
 };
 
 const Parser = struct {
@@ -150,9 +153,11 @@ const Parser = struct {
                 if (n == 0 and !self.seen_item) continue;
                 if (n != 0 and self.pending.items[n - 1].len == 0) continue;
                 try self.pending.append(self.gpa, "");
-            } else if (l[indentOf(l)] == '#') {
-                try self.pending.append(self.gpa, try self.keepComment(std.mem.trimEnd(u8, l[indentOf(l)..], " \t")));
-            } else break;
+            } else {
+                const body = std.mem.trim(u8, l, " \t");
+                if (body[0] != '#') break;
+                try self.pending.append(self.gpa, try self.keepComment(body));
+            }
         }
     }
 
@@ -161,9 +166,9 @@ const Parser = struct {
         if (self.pos >= self.lines.len) return null;
         const l = self.lines[self.pos];
         const ind = indentOf(l);
-        if (ind < l.len and l[ind] == '\t') return self.err("a tab cannot indent a line");
-        const sc = splitComment(l[ind..]);
-        return .{ .indent = ind, .content = std.mem.trimEnd(u8, sc.content, " \t") };
+        const body = std.mem.trimStart(u8, l[ind..], " \t");
+        const sc = splitComment(body);
+        return .{ .indent = ind, .content = std.mem.trimEnd(u8, sc.content, " \t"), .tabbed = body.len != l.len - ind };
     }
 
     /// Quoted scalars may hold any character that is not a C0 control; all
@@ -247,6 +252,10 @@ const Parser = struct {
         const c = (try self.cur()) orelse return null_scalar;
         if (@as(i64, @intCast(c.indent)) <= parent) return null_scalar;
         if (isDocMarker(c)) return null_scalar;
+        if (c.tabbed) {
+            if (isSeqEntry(c.content) or try self.splitKey(c.content) != null) return self.err("a tab cannot indent a line");
+            return self.scalarAt(self.lines[self.pos][c.indent..], parent);
+        }
         const is_seq = isSeqEntry(c.content);
         if (is_seq or try self.splitKey(c.content) != null) {
             try self.enter();
@@ -260,11 +269,11 @@ const Parser = struct {
 
     /// `---` or `...` at the start of a line ends or starts a document.
     fn isDocMarker(c: Cur) bool {
-        return c.indent == 0 and isForbidden(c.content);
+        return c.indent == 0 and !c.tabbed and isForbidden(c.content);
     }
 
     fn isSeqEntry(content: []const u8) bool {
-        return content.len != 0 and content[0] == '-' and (content.len == 1 or content[1] == ' ');
+        return content.len != 0 and content[0] == '-' and (content.len == 1 or isWhite(content[1]));
     }
 
     fn sequence(self: *Parser, indent: usize) Error!Value {
@@ -274,13 +283,15 @@ const Parser = struct {
             try self.skipBlank();
             const c = (try self.cur()) orelse break;
             if (c.indent < indent or isDocMarker(c)) break;
+            if (c.tabbed) return self.err("a tab cannot indent a line");
             if (c.indent > indent) return self.err("bad indentation of a sequence entry");
             if (!isSeqEntry(c.content)) break;
             const before = try self.takeBefore();
             const raw = self.lines[self.pos];
             var j = indent + 1;
-            while (j < raw.len and raw[j] == ' ') j += 1;
+            while (j < raw.len and isWhite(raw[j])) j += 1;
             const rest = raw[j..];
+            const tab_separated = std.mem.indexOfScalar(u8, raw[indent..j], '\t') != null;
             var item: Value = undefined;
             var after: ?[]const u8 = null;
             const sc = splitComment(rest);
@@ -292,6 +303,14 @@ const Parser = struct {
                     if (self.step == 0 and nx.indent > indent and nx.indent - indent <= 8) self.step = @intCast(nx.indent - indent);
                 }
                 item = try self.block(@intCast(indent));
+            } else if (tab_separated) {
+                // A collection that starts on the dash's line is indented by
+                // the blanks before it, so those must be spaces.
+                const content = std.mem.trimEnd(u8, sc.content, " \t");
+                if (isSeqEntry(content) or try self.splitKey(content) != null)
+                    return self.err("a tab cannot indent a collection");
+                item = try self.scalarAt(rest, @intCast(indent));
+                after = self.takeTrailing();
             } else {
                 // The entry's content starts on the dash's line: parse it as a
                 // line of its own, indented to where it starts.
@@ -355,6 +374,7 @@ const Parser = struct {
             try self.skipBlank();
             const c = (try self.cur()) orelse break;
             if (c.indent < indent or isDocMarker(c)) break;
+            if (c.tabbed) return self.err("a tab cannot indent a line");
             if (c.indent > indent) return self.err("bad indentation of a mapping entry");
             if (isSeqEntry(c.content)) break;
             const ki = (try self.splitKey(c.content)) orelse return self.err("expected 'key:'");
@@ -373,7 +393,7 @@ const Parser = struct {
                 if (next != null and next.?.indent > indent) {
                     if (self.step == 0 and next.?.indent - indent <= 8) self.step = @intCast(next.?.indent - indent);
                     v = try self.block(@intCast(indent));
-                } else if (next != null and next.?.indent == indent and isSeqEntry(next.?.content)) {
+                } else if (next != null and next.?.indent == indent and !next.?.tabbed and isSeqEntry(next.?.content)) {
                     try self.enter();
                     defer self.depth -= 1;
                     v = try self.sequence(indent);

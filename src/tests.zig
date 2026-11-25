@@ -471,3 +471,17 @@ test "non-printable characters" {
         try testing.expectError(error.InvalidComment, doc.setComments(&.{"a"}, .{ .before = &.{bad} }));
     }
 }
+
+test "tabs separate but do not indent" {
+    var doc = try parse("a:\t b\n\t# comment\nc:\n \td\ne:\n-\t-1\n-\t[x]\n");
+    defer doc.deinit();
+    const m = doc.root.map;
+    try testing.expectEqualStrings("b", m.getString("a").?);
+    try testing.expectEqualStrings("d", m.getString("c").?);
+    try testing.expectEqual(@as(i64, -1), m.getSeq("e").?.items.items[0].scalar.asInt().?);
+    var flow = try parse("\t[\n\t]\n");
+    flow.deinit();
+    for ([_][]const u8{ "a:\n\tb: 1\n", "a:\n \tb: 1\n", "a:\n\tb\n", "-\t-\n", "- \t- x\n", "-\tk: v\n", "a: 1\n\tb: 2\n", "- a\n\t- b\n" }) |src| {
+        try rejects(src, error.Syntax);
+    }
+}
