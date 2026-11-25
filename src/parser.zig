@@ -360,13 +360,16 @@ const Parser = struct {
                 after = if (sc.comment) |t| try self.keepComment(t) else null;
                 self.pos += 1;
                 try self.skipBlank();
-                if (try self.cur()) |nx| {
-                    if (self.step == 0 and nx.indent > indent and nx.indent - indent <= 8) self.step = @intCast(nx.indent - indent);
-                }
+                const next = try self.cur();
+                const present = next != null and next.?.indent > indent;
+                if (present and self.step == 0 and next.?.indent - indent <= 8) self.step = @intCast(next.?.indent - indent);
                 item = try self.block(@intCast(indent));
-                const found = try self.commentsAround(item, before, after);
-                before = found.before;
-                after = found.after;
+                // After a null item, pending comments belong to what follows.
+                if (present) {
+                    const found = try self.commentsAround(item, before, after);
+                    before = found.before;
+                    after = found.after;
+                }
             } else if (tab_separated) {
                 // A collection that starts on the dash's line is indented by
                 // the blanks before it, so those must be spaces.

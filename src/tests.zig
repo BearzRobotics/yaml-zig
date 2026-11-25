@@ -805,3 +805,10 @@ test "every spelling of the special floats, and large integers" {
     try testing.expectEqual(@as(?i64, 15), doc.root.map.getInt("a"));
     try testing.expectEqual(@as(?i64, null), doc.root.map.getInt("b"));
 }
+
+test "an empty entry leaves the following comments where they are" {
+    try roundTrips("-\n# about the second\n- b\n");
+    try roundTrips("-\n-\n# end\n");
+    try roundTrips("- # one\n# two\n- # three\n# end\n");
+    try roundTrips("a:\n# about b\nb:\n# end\n");
+}
