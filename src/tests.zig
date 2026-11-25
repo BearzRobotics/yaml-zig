@@ -225,8 +225,7 @@ test "strings that need quoting are quoted" {
 }
 
 test "unsupported and invalid input is rejected" {
-    try rejects("a: &x 1\n", error.Unsupported);
-    try rejects("a: *x\n", error.Unsupported);
+    try rejects("a: *x\n", error.Syntax);
     try rejects("? a\n: b\n", error.Unsupported);
     try rejects("a: 1\n---\nb: 2\n", error.Unsupported);
     try rejects("a: 1\na: 2\n", error.Syntax);
@@ -307,6 +306,7 @@ test "no leaks or swallowed errors on allocation failure" {
     try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "%YAML 1.2\n---\na: [1]\n# c\n...\n# d\n---\nb\n---\n")});
     try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "# nothing\n")});
     try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "%TAG !e! x:\n--- !e!a\n!!str k: !<a:b> [!c v]\nl:\n  !t\n  # c\n  - !!int 1\n")});
+    try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{@as([]const u8, "a: &a [1, *a, &b x]\nb: *b\n&c key: &d\n  *c : *d\n")});
     try testing.checkAllAllocationFailures(testing.allocator, buildAndEdit, .{});
     try testing.checkAllAllocationFailures(testing.allocator, readAll, .{});
 }
@@ -331,7 +331,7 @@ test "random bytes never crash the parser" {
 // tree, and writing that again gives the same text. The input is random
 // strings of YAML's own tokens, so that much of it parses.
 test "every accepted input survives writing" {
-    const tokens = [_][]const u8{ "!", "!!str ", "!!int", "!t ", "!<a:b> ", "!e!x ", "! ", "a", "b", ":", " ", " ", " ", "  ", "\n", "\n", "\n", "- ", "-", "#", " # c", "\"", "'", "[", "]", "{", "}", ",", "|", ">", "+", "2", ".", "...", "---", "\\", "\t", "k: ", "x", "\r", "?", "&", "true", "null", "\\n", "|2", ">-", "\n  ", "\n- ", ": ", "\u{85}", "\u{7f}" };
+    const tokens = [_][]const u8{ "&a ", "*a", "*a ", "&b", "&a", "!", "!!str ", "!!int", "!t ", "!<a:b> ", "!e!x ", "! ", "a", "b", ":", " ", " ", " ", "  ", "\n", "\n", "\n", "- ", "-", "#", " # c", "\"", "'", "[", "]", "{", "}", ",", "|", ">", "+", "2", ".", "...", "---", "\\", "\t", "k: ", "x", "\r", "?", "&", "true", "null", "\\n", "|2", ">-", "\n  ", "\n- ", ": ", "\u{85}", "\u{7f}" };
     var prng = std.Random.DefaultPrng.init(1);
     const rnd = prng.random();
     var buf: std.ArrayList(u8) = .empty;
@@ -382,7 +382,9 @@ test "every accepted input survives writing" {
 /// Equal values, kinds and key order. Every spelling of null is the same.
 fn expectSame(a: yaml.Value, b: yaml.Value) !void {
     try testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
+    try testing.expectEqualStrings(if (a.anchorOf()) |x| x.name else "", if (b.anchorOf()) |y| y.name else "");
     switch (a) {
+        .alias => |x| try testing.expectEqualStrings(x.name, b.alias.name),
         .scalar => |s| {
             try testing.expectEqualDeep(s.tag, b.scalar.tag);
             try testing.expectEqual(s.kind, b.scalar.kind);
@@ -471,7 +473,6 @@ test "invalid flow collections are rejected" {
     try rejects("a: [x\n  y: z]\n", error.Syntax);
     try rejects("a: {x: 1, x: 2}\n", error.Syntax);
     try rejects("a: {? x: 1}\n", error.Unsupported);
-    try rejects("a: [&x 1]\n", error.Unsupported);
     try rejects("a: {[b]: c}\n", error.Unsupported);
     try rejects("[b]: c\n", error.Unsupported);
 }
@@ -521,11 +522,12 @@ test "content on the '---' line" {
     try rejects("--- - a\n", error.Syntax);
 }
 
-test "anchors, tags and aliases on keys are refused, not read as text" {
-    try rejects("&a key: v\n", error.Unsupported);
-    try rejects("*a : 1\n", error.Unsupported);
-    try rejects("- &a x: 1\n", error.Unsupported);
-    try rejects("a: 1\n&b c: 2\n", error.Unsupported);
+test "properties and reserved indicators on keys are not read as text" {
+    var doc = try parse("&a key: v\n!!str other: *a\nx: &b more\n*b : again\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("v", doc.root.map.getString("key").?);
+    try testing.expectEqualStrings("key", doc.root.map.getString("other").?);
+    try rejects("*a : 1\n", error.Syntax);
     try rejects("?\ta\n", error.Unsupported);
     try rejects("@a: 1\n", error.Syntax);
     try rejects("`a: 1\n", error.Syntax);
@@ -1276,4 +1278,160 @@ test "an empty tagged value does not take the comments after it" {
     }
     try expectStable("a:\n  # above\n  !t\n# before b\nb: 1\n", "# above\na: !t\n# before b\nb: 1\n");
     try expectStable("# top\n!t\n# end\n", "# top\n!t\n# end\n");
+}
+
+test "anchors and aliases" {
+    var doc = try parse("base: &base\n  host: a\n  port: 80\nlist: [&x 1, *x]\nother: *base\ns: &s text\nt: *s\n");
+    defer doc.deinit();
+    const m = doc.root.map;
+    // Lookups follow aliases; the entries show them.
+    try testing.expectEqual(@as(?i64, 80), m.getMap("other").?.getInt("port"));
+    try testing.expectEqual(m.getMap("base").?, m.getMap("other").?);
+    try testing.expectEqualStrings("text", m.getString("t").?);
+    try testing.expect(m.entries.values()[m.find("other").?].value == .alias);
+    try testing.expectEqualStrings("base", m.entries.values()[m.find("other").?].value.alias.name);
+    try testing.expectEqualStrings("mapping", m.entries.values()[m.find("other").?].value.typeName());
+    try testing.expectEqual(@as(?i64, 1), doc.lookup(&.{ "list", "1" }).?.scalar.asInt());
+    try testing.expectEqualStrings("a", doc.lookup(&.{ "other", "host" }).?.scalar.text);
+    var back = try writeAndRead(&doc);
+    defer back.deinit();
+    try expectSame(doc.root, back.root);
+}
+
+test "anchors and aliases are written back" {
+    try roundTrips("a: &a 1\nb: *a\n");
+    try roundTrips("a: &a\n  b: 1\nc: *a\nd: &d !t\n  - *a\n  - &e\n    k: *d\n  - *e\n");
+    try roundTrips("&k key: &v value\nr: &r ref\n*r : *v\ns: *k\nf: [&x a, *x, &y [*x], *y, &z {*x : *y}, *z]\n");
+    try roundTrips("--- &r\n- 1\n- *r\n");
+    try roundTrips("- &a\n- *a\n- &b # why\n  k: v\n- *b # also\n");
+    try roundTrips("a: &a: x\nb: *a:\n");
+    // A name may be given again; an alias means the latest one above it.
+    var doc = try parse("a: &x 1\nb: *x\nc: &x 2\nd: *x\n");
+    defer doc.deinit();
+    try testing.expectEqual(@as(?i64, 1), doc.root.map.getInt("b"));
+    try testing.expectEqual(@as(?i64, 2), doc.root.map.getInt("d"));
+}
+
+test "a node may hold an alias of itself" {
+    var doc = try parse("a: &a [1, *a]\nm: &m\n  self: *m\n");
+    defer doc.deinit();
+    const q = doc.root.map.getSeq("a").?;
+    try testing.expectEqual(q, q.items.items[1].deref().seq);
+    const m = doc.root.map.getMap("m").?;
+    try testing.expectEqual(m, m.getMap("self").?);
+    try testing.expectEqual(m, doc.lookup(&.{ "m", "self", "self", "self" }).?.map);
+    var back = try writeAndRead(&doc);
+    back.deinit();
+    // But a key cannot be the node it is in: its hash would not be known.
+    try rejects("&a\n*a : 1\n", error.Unsupported);
+    try rejects("&a { *a : 1 }\n", error.Unsupported);
+}
+
+test "aliases are never expanded" {
+    // 'Billion laughs': each level aliases the one before it ten times.
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "l0: &l0 [x,x,x,x,x,x,x,x,x,x]\n");
+    for (1..30) |i| {
+        try src.print(testing.allocator, "l{d}: &l{d} [", .{ i, i });
+        for (0..10) |_| try src.print(testing.allocator, "*l{d},", .{i - 1});
+        try src.appendSlice(testing.allocator, "]\n");
+    }
+    // Used as keys too, where they are hashed and compared.
+    try src.appendSlice(testing.allocator, "*l29 : a\n*l28 : b\n");
+    var doc = try yaml.Document.parse(testing.allocator, src.items, .{}, null);
+    defer doc.deinit();
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(out.len < 2 * src.items.len);
+    // Expanded, the last level alone would hold 10^30 items.
+    try testing.expect(doc.arena.queryCapacity() < 1 << 20);
+}
+
+test "many keys that alias one large node stay cheap" {
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "big: &big [");
+    for (0..20_000) |_| try src.appendSlice(testing.allocator, "x,");
+    try src.appendSlice(testing.allocator, "]\n");
+    for (0..5_000) |i| try src.print(testing.allocator, "m{d}: {{*big : 1}}\n", .{i});
+    var doc = try yaml.Document.parse(testing.allocator, src.items, .{}, null);
+    doc.deinit();
+}
+
+test "keys that alias are compared by what they stand for" {
+    try rejects("a: &a k\n*a : 1\nk: 2\n", error.Syntax);
+    try rejects("a: &a k\nm: {k: 1, *a : 2}\n", error.Syntax);
+    try rejects("&k k: 1\nk: 2\n", error.Syntax);
+    var doc = try parse("a: &a name\n*a : found\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("found", doc.root.map.getString("name").?);
+}
+
+test "bad anchors and aliases are rejected" {
+    for ([_][]const u8{
+        "a: *x\n",            "a: *x\nb: &x 1\n",    "a: &\n",               "a: *\n",      "a: &x &y 1\n",
+        "a: &x *y\n",         "a: &x 1\nb: &y *x\n", "a: &x 1\nb: !t *x\n",  "a: &x[1]\n",  "a: &x - y\n",
+        "- &x\n  &y z\n",     "a: &x 1\nb: *x y\n",  "a: &x 1\nb: [*x y]\n", "[&x &y 1]\n", "&x - a\n",
+        "a: &x 1\nb: *x#c\n",
+    }) |src| {
+        errdefer std.debug.print("source: {s}\n", .{src});
+        try rejects(src, error.Syntax);
+    }
+    // Anchors belong to one document.
+    try rejectsStream("a: &x 1\n---\nb: *x\n", error.Syntax);
+}
+
+test "editing keeps aliases pointing at their place" {
+    var doc = try parse("a: &a 1\nb: *a\nc: &c\n  k: v\nd: *c\n");
+    defer doc.deinit();
+    // Replacing an anchored value: its aliases stand for the new one.
+    try doc.set(&.{"a"}, try doc.integer(2));
+    try testing.expectEqual(@as(?i64, 2), doc.root.map.getInt("b"));
+    // Editing through an alias edits the shared node.
+    try doc.set(&.{ "d", "k" }, try doc.string("w"));
+    try testing.expectEqualStrings("w", doc.root.map.getMap("c").?.getString("k").?);
+    // Replacing the alias itself leaves the original alone.
+    try doc.set(&.{"d"}, try doc.string("plain"));
+    try testing.expectEqualStrings("w", doc.root.map.getMap("c").?.getString("k").?);
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("a: &a 2\nb: *a\nc: &c\n  k: w\nd: plain\n", out);
+}
+
+test "an alias that would not read back is not written" {
+    var doc = try parse("a: &a 1\nb: *a\n");
+    defer doc.deinit();
+    // The anchored node is gone.
+    try testing.expect(doc.root.map.remove("a"));
+    try testing.expectError(error.BrokenAlias, doc.toOwnedString(testing.allocator));
+    // It now comes after its alias.
+    var moved = try parse("a: &a 1\nb: *a\n");
+    defer moved.deinit();
+    const first = moved.root.map.entries.values()[0].value;
+    try testing.expect(moved.root.map.remove("a"));
+    try moved.root.map.put(moved.allocator(), "a", first);
+    try testing.expectError(error.BrokenAlias, moved.toOwnedString(testing.allocator));
+    // Another node took the name in between.
+    var shadowed = try parse("a: &a 1\nm: 0\nb: *a\n");
+    defer shadowed.deinit();
+    var other = try shadowed.integer(5);
+    _ = try shadowed.anchorNode(&other, "a");
+    try shadowed.set(&.{"m"}, other);
+    try testing.expectError(error.BrokenAlias, shadowed.toOwnedString(testing.allocator));
+}
+
+test "anchors and aliases made through the API" {
+    var doc = try yaml.Document.init(testing.allocator);
+    defer doc.deinit();
+    var shared = try doc.newMap();
+    try shared.map.put(doc.allocator(), "k", try doc.integer(1));
+    const anchor = try doc.anchorNode(&shared, "s");
+    try doc.set(&.{"first"}, shared);
+    try doc.set(&.{"second"}, .{ .alias = anchor });
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("first: &s\n  k: 1\nsecond: *s\n", out);
+    anchor.name = "not a name";
+    try testing.expectError(error.InvalidAnchor, doc.toOwnedString(testing.allocator));
 }

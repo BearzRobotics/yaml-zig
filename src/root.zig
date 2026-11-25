@@ -23,6 +23,7 @@ pub const Kind = @import("value.zig").Kind;
 pub const Style = @import("value.zig").Style;
 pub const Seq = @import("value.zig").Seq;
 pub const Map = @import("value.zig").Map;
+pub const Anchor = @import("value.zig").Anchor;
 pub const Comments = @import("value.zig").Comments;
 pub const ParseError = parser.Error;
 pub const Options = @import("parser.zig").Options;
@@ -150,6 +151,23 @@ pub const Document = struct {
         return .{ .scalar = .{ .text = "", .style = .plain, .kind = .null } };
     }
 
+    /// Puts the anchor `&name` on the node `v`, which must not be an alias,
+    /// and returns it. `.{ .alias = anchor }` is then an alias of the node; it
+    /// must be written after it.
+    pub fn anchorNode(self: *Document, v: *Value, name: []const u8) Allocator.Error!*Anchor {
+        std.debug.assert(v.* != .alias);
+        const a = try self.allocator().create(Anchor);
+        const owned = try self.dupe(name);
+        switch (v.*) {
+            .scalar => |*s| s.anchor = a,
+            .seq => |q| q.anchor = a,
+            .map => |m| m.anchor = a,
+            .alias => unreachable,
+        }
+        a.* = .{ .name = owned, .value = v.* };
+        return a;
+    }
+
     pub fn newMap(self: *Document) Allocator.Error!Value {
         const m = try self.allocator().create(Map);
         m.* = .{};
@@ -175,7 +193,9 @@ pub const Document = struct {
         const a = self.allocator();
         var cur = self.root;
         for (path[0 .. path.len - 1]) |seg| {
-            switch (cur) {
+            // A path through an alias edits the anchored node.
+            switch (cur.deref()) {
+                .alias => unreachable,
                 .map => |m| {
                     if (m.getPtr(seg)) |next| {
                         cur = next.*;
@@ -190,10 +210,11 @@ pub const Document = struct {
             }
         }
         const last = path[path.len - 1];
-        switch (cur) {
+        switch (cur.deref()) {
             .map => |m| try m.put(a, try self.dupe(last), v),
-            .seq => |q| q.items.items[try index(q, last)] = v,
+            .seq => |q| @import("value.zig").replaceNode(&q.items.items[try index(q, last)], v),
             .scalar => return error.NotACollection,
+            .alias => unreachable,
         }
     }
 
@@ -209,8 +230,9 @@ pub const Document = struct {
         for (path) |seg| {
             switch (cur) {
                 .map => |m| cur = m.get(seg) orelse return null,
-                .seq => |q| cur = q.items.items[index(q, seg) catch return null],
+                .seq => |q| cur = q.items.items[index(q, seg) catch return null].deref(),
                 .scalar => return null,
+                .alias => unreachable,
             }
         }
         return cur;
@@ -233,7 +255,8 @@ pub const Document = struct {
         };
         const parent = if (path.len == 1) self.root else self.lookup(path[0 .. path.len - 1]) orelse return error.NotFound;
         const last = path[path.len - 1];
-        switch (parent) {
+        switch (parent.deref()) {
+            .alias => unreachable,
             .map => |m| {
                 if (m.get(last) == null) return error.NotFound;
                 try m.setComments(last, own);
@@ -261,6 +284,7 @@ pub const Document = struct {
             .directives = self.directives,
             .explicit_end = self.explicit_end,
             .max_depth = self.max_depth,
+            .gpa = self.arena.child_allocator,
         };
     }
 
@@ -270,7 +294,7 @@ pub const Document = struct {
     }
 };
 
-pub const ToStringError = Allocator.Error || error{ WriteFailed, InvalidUtf8, NestingTooDeep, InvalidDirective, InvalidTag };
+pub const ToStringError = writer.CheckError || error{WriteFailed};
 
 fn toString(value: anytype, gpa: Allocator) ToStringError![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -278,7 +302,7 @@ fn toString(value: anytype, gpa: Allocator) ToStringError![]u8 {
     value.write(&aw.writer) catch |e| switch (e) {
         // An allocating writer fails only when it cannot grow.
         error.WriteFailed => return error.OutOfMemory,
-        error.InvalidUtf8, error.NestingTooDeep, error.InvalidDirective, error.InvalidTag => |other| return other,
+        else => |other| return other,
     };
     return aw.toOwnedSlice();
 }

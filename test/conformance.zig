@@ -196,9 +196,11 @@ fn sameStructure(a: std.mem.Allocator, documents: []const yaml.Document, expecte
 
 fn events(w: *std.Io.Writer, v: yaml.Value) !void {
     switch (v) {
+        .alias => |a| try w.print("=ALI *{s}\n", .{a.name}),
         .scalar => |s| try scalarEvent(w, s),
         .seq => |q| {
             try w.print("+SEQ{s}", .{if (q.flow) " []" else ""});
+            try anchorEvent(w, q.anchor);
             try tagEvent(w, q.tag);
             try w.writeByte('\n');
             for (q.items.items) |item| try events(w, item);
@@ -206,6 +208,7 @@ fn events(w: *std.Io.Writer, v: yaml.Value) !void {
         },
         .map => |m| {
             try w.print("+MAP{s}", .{if (m.flow) " {}" else ""});
+            try anchorEvent(w, m.anchor);
             try tagEvent(w, m.tag);
             try w.writeByte('\n');
             for (m.entries.keys(), m.entries.values()) |k, e| {
@@ -215,6 +218,10 @@ fn events(w: *std.Io.Writer, v: yaml.Value) !void {
             try w.writeAll("-MAP\n");
         },
     }
+}
+
+fn anchorEvent(w: *std.Io.Writer, anchor: ?*yaml.Anchor) !void {
+    if (anchor) |a| try w.print(" &{s}", .{a.name});
 }
 
 fn tagEvent(w: *std.Io.Writer, tag: ?[]const u8) !void {
@@ -230,6 +237,7 @@ fn scalarEvent(w: *std.Io.Writer, s: yaml.Scalar) !void {
         .folded => '>',
     };
     try w.writeAll("=VAL");
+    try anchorEvent(w, s.anchor);
     try tagEvent(w, s.tag);
     try w.print(" {c}", .{indicator});
     for (s.text) |c| switch (c) {
@@ -243,11 +251,15 @@ fn scalarEvent(w: *std.Io.Writer, s: yaml.Scalar) !void {
     try w.writeByte('\n');
 }
 
-fn matches(v: yaml.Value, want: Json) bool {
+fn matches(v_in: yaml.Value, want: Json) bool {
+    // The JSON value is finite, so following aliases ends.
+    const v = v_in.deref();
     switch (want) {
         .null => return v == .scalar and v.scalar.kind == .null,
         .bool => |b| return v == .scalar and v.scalar.asBool() == b,
-        .integer => |i| return v == .scalar and v.scalar.asInt() == i,
+        // JSON writes a whole float such as `450.00` as `450`.
+        .integer => |i| return v == .scalar and (v.scalar.asInt() == i or
+            (v.scalar.kind == .float and v.scalar.asFloat() == @as(f64, @floatFromInt(i)))),
         .float => |f| return v == .scalar and v.scalar.asFloat() == f,
         .number_string => |s| return v == .scalar and std.mem.eql(u8, v.scalar.text, s),
         .string => |s| return v == .scalar and v.scalar.kind == .string and std.mem.eql(u8, v.scalar.text, s),
@@ -267,6 +279,7 @@ fn matches(v: yaml.Value, want: Json) bool {
 /// Equal values, kinds and key order (every spelling of null is the same).
 fn same(a: yaml.Value, b: yaml.Value) bool {
     switch (a) {
+        .alias => |x| return b == .alias and std.mem.eql(u8, x.name, b.alias.name),
         .scalar => |s| return b == .scalar and s.kind == b.scalar.kind and
             (s.kind == .null or std.mem.eql(u8, s.text, b.scalar.text)),
         .seq => |q| {

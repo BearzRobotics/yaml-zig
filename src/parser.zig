@@ -32,6 +32,7 @@ const Scalar = model.Scalar;
 const Seq = model.Seq;
 const Map = model.Map;
 const Comments = model.Comments;
+const Anchor = model.Anchor;
 
 pub const Error = error{
     /// Malformed YAML, or a construct YAML forbids (duplicate key, bad indentation).
@@ -180,6 +181,8 @@ const Parser = struct {
     /// Set when a node turned out to be empty after lines of properties: how
     /// many pending comment lines stood above them. The rest follow the node.
     own_pending: ?usize = null,
+    /// The current document's anchors; a name may be given again.
+    anchors: std.StringHashMapUnmanaged(*Anchor) = .empty,
     /// The current document's `%TAG` handles and their prefixes.
     handles: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Where the text of one scalar is put together before it is copied to the
@@ -306,6 +309,7 @@ const Parser = struct {
             .scalar => true,
             .seq => |q| q.flow,
             .map => |m| m.flow,
+            .alias => true,
         };
     }
 
@@ -343,6 +347,7 @@ const Parser = struct {
         var directives: std.ArrayList([]const u8) = .empty;
         var seen_yaml = false;
         self.handles = .empty;
+        self.anchors = .empty;
         const first = while (true) {
             // A byte order mark may start any document.
             if (self.after_end and self.pos < self.lines.len and std.mem.startsWith(u8, self.lines[self.pos], byte_order_mark))
@@ -594,11 +599,12 @@ const Parser = struct {
 
     const Props = struct {
         tag: ?[]const u8 = null,
+        anchor: ?*Anchor = null,
         /// What follows the properties on their line.
         rest: []const u8 = "",
 
         fn any(self: Props) bool {
-            return self.tag != null;
+            return self.tag != null or self.anchor != null;
         }
     };
 
@@ -607,7 +613,14 @@ const Parser = struct {
         var props: Props = .{ .rest = rest };
         while (props.rest.len != 0) {
             switch (props.rest[0]) {
-                '&' => return self.failHere(props.rest, "anchors and aliases are not supported", error.Unsupported),
+                '&' => {
+                    if (props.anchor != null) return self.errAt(props.rest, "a node cannot have two anchors");
+                    const name = anchorName(props.rest[1..]);
+                    const after = props.rest[1 + name.len ..];
+                    if (name.len == 0 or (after.len != 0 and !isWhite(after[0]))) return self.errAt(props.rest, "bad anchor");
+                    props.anchor = try self.defineAnchor(name);
+                    props.rest = std.mem.trimStart(u8, after, " \t");
+                },
                 '!' => {
                     if (props.tag != null) return self.errAt(props.rest, "a node cannot have two tags");
                     const tag = try self.readTag(props.rest, false) orelse return self.errAt(props.rest, "bad tag");
@@ -618,6 +631,28 @@ const Parser = struct {
             }
         }
         return props;
+    }
+
+    /// The name that starts `s`, which follows `&` or `*`.
+    fn anchorName(s: []const u8) []const u8 {
+        var end: usize = 0;
+        while (end < s.len and !isWhite(s[end]) and std.mem.findScalar(u8, ",[]{}", s[end]) == null) end += 1;
+        return s[0..end];
+    }
+
+    /// An anchor takes effect where it is written: the node it is on, which
+    /// has yet to be read, may hold aliases of itself.
+    fn defineAnchor(self: *Parser, name: []const u8) Error!*Anchor {
+        try self.checkPrintable(name);
+        const a = try self.a.create(Anchor);
+        a.* = .{ .name = try self.a.dupe(u8, name), .value = null_scalar, .complete = false };
+        try self.anchors.put(self.a, a.name, a);
+        return a;
+    }
+
+    /// The anchor an alias named `name` refers to.
+    fn lookupAnchor(self: *Parser, name: []const u8) ?*Anchor {
+        return self.anchors.get(name);
     }
 
     const Tag = struct { name: []const u8, len: usize };
@@ -661,19 +696,41 @@ const Parser = struct {
 
     fn merge(self: *Parser, outer: Props, inner: Props) Error!Props {
         if (outer.tag != null and inner.tag != null) return self.err("a node cannot have two tags");
-        return .{ .tag = outer.tag orelse inner.tag, .rest = inner.rest };
+        if (outer.anchor != null and inner.anchor != null) return self.err("a node cannot have two anchors");
+        return .{ .tag = outer.tag orelse inner.tag, .anchor = outer.anchor orelse inner.anchor, .rest = inner.rest };
     }
 
-    fn apply(_: *Parser, v: *Value, props: Props) Error!void {
-        const tag = props.tag orelse return;
+    /// Gives a node that has just been read its properties.
+    fn apply(self: *Parser, v: *Value, props: Props) Error!void {
+        if (!props.any()) return;
         switch (v.*) {
             .scalar => |*s| {
-                s.tag = tag;
-                s.kind = model.kindOf(tag, s.style, s.text);
+                if (props.tag) |tag| {
+                    s.tag = tag;
+                    s.kind = model.kindOf(tag, s.style, s.text);
+                }
+                s.anchor = props.anchor orelse s.anchor;
             },
-            .seq => |q| q.tag = tag,
-            .map => |m| m.tag = tag,
+            .seq => |q| {
+                q.tag = props.tag orelse q.tag;
+                q.anchor = props.anchor orelse q.anchor;
+            },
+            .map => |m| {
+                m.tag = props.tag orelse m.tag;
+                m.anchor = props.anchor orelse m.anchor;
+            },
+            .alias => return self.err("an alias cannot have properties"),
         }
+        if (props.anchor) |a| {
+            a.value = v.*;
+            a.complete = true;
+        }
+    }
+
+    /// A key's hash is taken as it goes in, so what it refers to must be whole.
+    fn checkKey(self: *Parser, key: Value, column: usize) Error!void {
+        if (key == .alias and !key.alias.complete)
+            return failAt(self.diag, self.pos + 1, column, "a key cannot be an alias of a node that holds it", error.Unsupported);
     }
 
     /// A node with no content, which may still have properties.
@@ -727,7 +784,19 @@ const Parser = struct {
     fn readNode(self: *Parser, rest_in: []const u8, parent: i64, keys: bool) Error!Node {
         const rest = std.mem.trimStart(u8, rest_in, " \t");
         switch (rest[0]) {
-            '*' => return self.failHere(rest, "anchors and aliases are not supported", error.Unsupported),
+            '*' => {
+                const name = anchorName(rest[1..]);
+                const tail = rest[1 + name.len ..];
+                const target = if (name.len != 0) self.lookupAnchor(name) else null;
+                const anchor = target orelse return self.errAt(rest, "an alias needs an anchor above it");
+                const after = std.mem.trimStart(u8, tail, " \t");
+                if (keys and isValueIndicator(after, 0))
+                    return .{ .key = .{ .column = self.columnOf(rest), .value = .{ .alias = anchor }, .rest = after[1..] } };
+                if (!endsLine(after) or (after.len != 0 and after.len == tail.len)) return self.errAt(rest, "unexpected text after an alias");
+                self.trailing = try self.commentOn(after);
+                self.pos += 1;
+                return .{ .value = .{ .alias = anchor } };
+            },
             '&', '!' => return self.errAt(rest, "properties cannot stand here"),
             '@', '`' => return self.errAt(rest, "a reserved indicator cannot start a scalar"),
             '%' => return self.errAt(rest, "a '%' cannot start a plain scalar"),
@@ -848,6 +917,7 @@ const Parser = struct {
         map.* = .{};
         var key = first_key;
         while (true) {
+            try self.checkKey(key.value, key.column);
             if (map.entries.contains(key.value)) return failAt(self.diag, self.pos + 1, key.column, "duplicate key", error.Syntax);
             var before = try self.takeBefore();
             const rest = std.mem.trimStart(u8, key.rest, " \t");
@@ -1294,12 +1364,21 @@ const Flow = struct {
     fn node(self: *Flow) Error!Value {
         var props: Parser.Props = .{};
         while (self.peek()) |c| {
-            if (c == '&') return self.p.unsupported("anchors and aliases are not supported");
-            if (c != '!') break;
-            if (props.tag != null) return self.err("a node cannot have two tags");
-            const tag = try self.p.readTag(self.line[self.i..], true) orelse return self.err("bad tag");
-            props.tag = tag.name;
-            self.i += tag.len;
+            if (c == '&') {
+                if (props.anchor != null) return self.err("a node cannot have two anchors");
+                const name = Parser.anchorName(self.line[self.i + 1 ..]);
+                if (name.len == 0) return self.err("bad anchor");
+                self.i += 1 + name.len;
+                if (self.peek()) |after| {
+                    if (after == '[' or after == '{') return self.err("bad anchor");
+                }
+                props.anchor = try self.p.defineAnchor(name);
+            } else if (c == '!') {
+                if (props.tag != null) return self.err("a node cannot have two tags");
+                const tag = try self.p.readTag(self.line[self.i..], true) orelse return self.err("bad tag");
+                props.tag = tag.name;
+                self.i += tag.len;
+            } else break;
             try self.skip();
         }
         var v: Value = null_scalar;
@@ -1323,7 +1402,13 @@ const Flow = struct {
                 const t = try self.p.decodeQuoted(g.quoted);
                 return .{ .scalar = .{ .text = t, .style = if (c == '"') .double else .single, .kind = .string } };
             },
-            '*' => return self.p.unsupported("anchors and aliases are not supported"),
+            '*' => {
+                const name = Parser.anchorName(self.line[self.i + 1 ..]);
+                const anchor = if (name.len != 0) self.p.lookupAnchor(name) else null;
+                if (anchor == null) return self.err("an alias needs an anchor above it");
+                self.i += 1 + name.len;
+                return .{ .alias = anchor.? };
+            },
             '&', '!' => return self.err("properties cannot stand here"),
             ',', ']', '}' => return self.err("a flow collection entry cannot be empty"),
             '|', '>', '%', '@', '`', '#' => return self.err("this character cannot start a value in a flow collection"),
@@ -1416,13 +1501,13 @@ const Flow = struct {
     }
 
     fn put(self: *Flow, m: *Map, key: Value, value: Value) Error!void {
-        const s = switch (key) {
-            .scalar => |s| s,
-            else => return self.p.unsupported("a collection as a key is not supported"),
-        };
-        const k: Value = .{ .scalar = s };
-        if (m.entries.contains(k)) return self.err("duplicate key");
-        try m.putValue(self.p.a, k, value);
+        switch (key) {
+            .scalar, .alias => {},
+            .seq, .map => return self.p.unsupported("a collection as a key is not supported"),
+        }
+        try self.p.checkKey(key, self.i + 1);
+        if (m.entries.contains(key)) return self.err("duplicate key");
+        try m.putValue(self.p.a, key, value);
     }
 
     /// Consumes the `,` after an entry, or stops before the closing bracket.
@@ -1482,7 +1567,7 @@ const Flow = struct {
 fn levelsIn(v: Value) usize {
     var deepest: usize = 0;
     switch (v) {
-        .scalar => return 0,
+        .scalar, .alias => return 0,
         .seq => |q| for (q.items.items) |item| {
             deepest = @max(deepest, levelsIn(item));
         },

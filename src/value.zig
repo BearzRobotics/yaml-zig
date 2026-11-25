@@ -22,6 +22,8 @@ pub const Scalar = struct {
     /// The tag written on the node, in full (`tag:yaml.org,2002:str`,
     /// `!local`, or `!` for the non-specific tag), or null if it has none.
     tag: ?[]const u8 = null,
+    /// The anchor on the node, which aliases refer to.
+    anchor: ?*Anchor = null,
 
     pub fn asBool(self: Scalar) ?bool {
         // A tag can give the kind to text that is not a boolean.
@@ -157,19 +159,78 @@ fn isFloat(t: []const u8) bool {
     return dot or exp;
 }
 
+/// `&name` on a node. The node carries a pointer to this, and so does every
+/// alias of it.
+pub const Anchor = struct {
+    name: []const u8,
+    /// The anchored node. Never an alias.
+    value: Value,
+    /// False only while the parser is still inside the node.
+    complete: bool = true,
+    /// The node's hash as a key, once something has needed it.
+    hash: ?u64 = null,
+};
+
 pub const Value = union(enum) {
     scalar: Scalar,
     seq: *Seq,
     map: *Map,
+    /// `*name`: the anchored node once more. It is a reference and is never
+    /// expanded, so a document is no larger in memory than its text suggests.
+    /// A node can hold an alias of itself, so code that follows aliases must
+    /// bound how far it goes.
+    alias: *Anchor,
+
+    /// The node an alias stands for; any other value as it is.
+    pub fn deref(self: Value) Value {
+        return switch (self) {
+            .alias => |a| a.value,
+            else => self,
+        };
+    }
+
+    /// The anchor on this node (an alias has none of its own).
+    pub fn anchorOf(self: Value) ?*Anchor {
+        return switch (self) {
+            .scalar => |s| s.anchor,
+            .seq => |q| q.anchor,
+            .map => |m| m.anchor,
+            .alias => null,
+        };
+    }
 
     pub fn typeName(self: Value) []const u8 {
-        return switch (self) {
+        return switch (self.deref()) {
             .scalar => |s| @tagName(s.kind),
             .seq => "sequence",
             .map => "mapping",
+            .alias => unreachable,
         };
     }
 };
+
+/// Puts `new` where `slot` was. An anchor stays with its place: aliases of the
+/// old node become aliases of the new one.
+pub fn replaceNode(slot: *Value, new: Value) void {
+    const anchor = slot.anchorOf();
+    slot.* = new;
+    const a = anchor orelse return;
+    switch (slot.*) {
+        .scalar => |*s| if (s.anchor == null) {
+            s.anchor = a;
+        } else return,
+        .seq => |q| if (q.anchor == null) {
+            q.anchor = a;
+        } else return,
+        .map => |m| if (m.anchor == null) {
+            m.anchor = a;
+        } else return,
+        // The anchored node is gone; writing will say so if it is still used.
+        .alias => return,
+    }
+    a.value = slot.*;
+    a.hash = null;
+}
 
 /// Comments on one item: the lines above it (each `#...`, or empty for a blank
 /// line) and a comment after it on its line (`#...`).
@@ -275,6 +336,13 @@ pub fn isUri(s: []const u8) bool {
         } else if (!std.ascii.isAlphanumeric(c) and std.mem.findScalar(u8, "-#;/?:@&=+$,_.!~*'()[]", c) == null) return false;
     }
     return true;
+}
+
+/// Made of `ns-anchor-char`: anything printable but blanks and `[]{},`.
+pub fn isAnchorName(name: []const u8) bool {
+    if (name.len == 0 or !std.unicode.utf8ValidateSlice(name) or findNonPrintable(name) != null) return false;
+    if (std.mem.indexOf(u8, name, "\u{feff}") != null) return false;
+    return std.mem.findAny(u8, name, " \t\r\n[]{},") == null;
 }
 
 /// What may stand between `!<` and `>`: a local tag (`!` and more) or a URI
@@ -387,8 +455,9 @@ pub const Seq = struct {
     comments: std.ArrayList(Comments) = .empty,
     /// Written as `[a, b]` (only if no item is a block collection).
     flow: bool = false,
-    /// As `Scalar.tag`.
+    /// As `Scalar.tag` and `Scalar.anchor`.
     tag: ?[]const u8 = null,
+    anchor: ?*Anchor = null,
 
     pub fn append(self: *Seq, arena: Allocator, v: Value) Allocator.Error!void {
         try self.items.append(arena, v);
@@ -401,10 +470,8 @@ pub const Seq = struct {
 /// string.
 pub const KeyContext = struct {
     pub fn hash(_: KeyContext, key: Value) u32 {
-        var h = std.hash.Wyhash.init(0);
         var budget: usize = compare_budget;
-        hashValue(&h, key, &budget);
-        return @truncate(h.final());
+        return @truncate(nodeHash(key, &budget));
     }
 
     pub fn eql(_: KeyContext, a: Value, b: Value, _: usize) bool {
@@ -457,10 +524,34 @@ fn hashScalar(h: *std.hash.Wyhash, tag: []const u8, content: []const u8) void {
     h.update(content);
 }
 
+/// The hash of a node, or of the node an alias stands for. It does not depend
+/// on whether the node has an anchor, but an anchored node's is computed once,
+/// so that many keys that alias one large node cost no more than one.
+fn nodeHash(v: Value, budget: *usize) u64 {
+    const anchor = (if (v == .alias) v.alias else v.anchorOf()) orelse return freshHash(v, budget);
+    if (anchor.hash) |known| return known;
+    // A node that holds itself finds this while it is being hashed.
+    anchor.hash = 0;
+    anchor.hash = freshHash(v.deref(), budget);
+    return anchor.hash.?;
+}
+
+fn freshHash(v: Value, budget: *usize) u64 {
+    var h = std.hash.Wyhash.init(0);
+    hashNode(&h, v, budget);
+    return h.final();
+}
+
 fn hashValue(h: *std.hash.Wyhash, v: Value, budget: *usize) void {
+    const part = nodeHash(v, budget);
+    h.update(std.mem.asBytes(&part));
+}
+
+fn hashNode(h: *std.hash.Wyhash, v: Value, budget: *usize) void {
     if (budget.* == 0) return;
     budget.* -= 1;
     switch (v) {
+        .alias => unreachable,
         .scalar => |s| {
             var buffer: [64]u8 = undefined;
             hashScalar(h, effectiveTag(s), canonical(s, &buffer));
@@ -484,11 +575,15 @@ fn hashValue(h: *std.hash.Wyhash, v: Value, budget: *usize) void {
     }
 }
 
-fn sameKey(a: Value, b: Value, budget: *usize) bool {
+fn sameKey(x_in: Value, y_in: Value, budget: *usize) bool {
+    if (x_in == .alias and y_in == .alias and x_in.alias == y_in.alias) return true;
     if (budget.* == 0) return false;
     budget.* -= 1;
+    const a = x_in.deref();
+    const b = y_in.deref();
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     switch (a) {
+        .alias => unreachable,
         .scalar => |s| {
             if (!std.mem.eql(u8, effectiveTag(s), effectiveTag(b.scalar))) return false;
             var x: [64]u8 = undefined;
@@ -528,14 +623,13 @@ const TextKey = struct {
     // A key with a tag of its own is found by text only through `find`'s scan.
     pub fn hash(self: TextKey, text: []const u8) u32 {
         const s: Scalar = .{ .text = text, .kind = self.kind };
-        var buffer: [64]u8 = undefined;
-        var h = std.hash.Wyhash.init(0);
-        hashScalar(&h, effectiveTag(s), canonical(s, &buffer));
-        return @truncate(h.final());
+        var budget: usize = compare_budget;
+        return @truncate(freshHash(.{ .scalar = s }, &budget));
     }
 
     pub fn eql(self: TextKey, text: []const u8, key: Value, _: usize) bool {
-        return key == .scalar and key.scalar.kind == self.kind and std.mem.eql(u8, key.scalar.text, text);
+        const node = key.deref();
+        return node == .scalar and node.scalar.kind == self.kind and std.mem.eql(u8, node.scalar.text, text);
     }
 };
 
@@ -546,10 +640,12 @@ pub const Map = struct {
     entries: Entries = .empty,
     /// Written as `{a: 1, b: 2}`.
     flow: bool = false,
-    /// As `Scalar.tag`.
+    /// As `Scalar.tag` and `Scalar.anchor`.
     tag: ?[]const u8 = null,
-    /// Some key has a tag; `putValue` keeps this up to date.
-    tagged_keys: bool = false,
+    anchor: ?*Anchor = null,
+    /// Some key has a tag, which can make it hash differently from its text, so
+    /// lookups may need to look at each; `putValue` keeps this up to date.
+    odd_keys: bool = false,
 
     pub const Entry = struct {
         value: Value,
@@ -574,26 +670,28 @@ pub const Map = struct {
         if (kind != .string) {
             if (self.entries.getIndexAdapted(text, TextKey{ .kind = kind })) |i| return i;
         }
-        // Keys with a tag this library does not interpret hash differently.
-        if (self.tagged_keys) {
+        // Some keys do not hash as their text suggests.
+        if (self.odd_keys) {
             for (self.entries.keys(), 0..) |k, i| {
-                if (k == .scalar and k.scalar.tag != null and std.mem.eql(u8, k.scalar.text, text)) return i;
+                const node = k.deref();
+                if (node == .scalar and node.scalar.tag != null and std.mem.eql(u8, node.scalar.text, text)) return i;
             }
         }
         return null;
     }
 
+    /// The value under `key`, following an alias. `entries` has it as written.
     pub fn get(self: *const Map, key: []const u8) ?Value {
-        return self.entries.values()[self.find(key) orelse return null].value;
+        return self.entries.values()[self.find(key) orelse return null].value.deref();
     }
 
     pub fn getPtr(self: *Map, key: []const u8) ?*Value {
         return &self.entries.values()[self.find(key) orelse return null].value;
     }
 
-    /// The value under a key of any kind.
+    /// The value under a key of any kind, following an alias.
     pub fn getValue(self: *const Map, key: Value) ?Value {
-        return (self.entries.get(key) orelse return null).value;
+        return (self.entries.get(key) orelse return null).value.deref();
     }
 
     /// The scalar text under `key` (any kind), or null.
@@ -644,16 +742,17 @@ pub const Map = struct {
     /// storage must be arena-owned.
     pub fn put(self: *Map, arena: Allocator, key: []const u8, v: Value) Allocator.Error!void {
         if (self.find(key)) |i| {
-            self.entries.values()[i].value = v;
+            replaceNode(&self.entries.values()[i].value, v);
         } else try self.putValue(arena, .{ .scalar = .{ .text = key } }, v);
     }
 
     /// `put` for a key of any kind.
     pub fn putValue(self: *Map, arena: Allocator, key: Value, v: Value) Allocator.Error!void {
-        if (key == .scalar and key.scalar.tag != null) self.tagged_keys = true;
+        const node = key.deref();
+        if (node == .scalar and node.scalar.tag != null) self.odd_keys = true;
         const gop = try self.entries.getOrPut(arena, key);
         if (gop.found_existing) {
-            gop.value_ptr.value = v;
+            replaceNode(&gop.value_ptr.value, v);
         } else gop.value_ptr.* = .{ .value = v };
     }
 
