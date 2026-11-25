@@ -389,35 +389,57 @@ pub const TagForm = union(enum) {
     verbatim: []const u8,
 };
 
-/// Chooses a form that reads back as `tag` in a document with `directives`, or
-/// fails if there is none.
-pub fn tagForm(tag: []const u8, directives: []const []const u8) error{InvalidTag}!TagForm {
-    if (tag.len == 0 or !std.unicode.utf8ValidateSlice(tag)) return error.InvalidTag;
-    if (std.mem.eql(u8, tag, "!")) return .non_specific;
-    var primary: []const u8 = "!";
-    var secondary: []const u8 = core_prefix;
-    var named: ?TagForm = null;
-    var best: usize = 0;
-    for (directives) |line| {
-        const d = parseDirective(line) catch continue;
-        if (d != .tag) continue;
-        if (std.mem.eql(u8, d.tag.handle, "!")) {
-            primary = d.tag.prefix;
-        } else if (std.mem.eql(u8, d.tag.handle, "!!")) {
-            secondary = d.tag.prefix;
-        } else if (d.tag.prefix.len > best and d.tag.prefix.len < tag.len and std.mem.startsWith(u8, tag, d.tag.prefix)) {
-            best = d.tag.prefix.len;
-            named = .{ .shorthand = .{ .handle = d.tag.handle, .suffix = tag[best..] } };
+/// The most `%TAG` directives one document may have. Real documents have a
+/// few; the limit keeps the work done for each tag small.
+pub const max_tag_directives = 64;
+
+/// A document's tag handles, read from its directives once.
+pub const TagTable = struct {
+    primary: []const u8 = "!",
+    secondary: []const u8 = core_prefix,
+    named: [max_tag_directives]Handle = undefined,
+    count: usize = 0,
+
+    const Handle = struct { handle: []const u8, prefix: []const u8 };
+
+    pub fn init(directives: []const []const u8) error{InvalidDirective}!TagTable {
+        var table: TagTable = .{};
+        var tags: usize = 0;
+        for (directives) |line| {
+            const d = try parseDirective(line);
+            if (d != .tag) continue;
+            tags += 1;
+            if (tags > max_tag_directives) return error.InvalidDirective;
+            if (std.mem.eql(u8, d.tag.handle, "!")) {
+                table.primary = d.tag.prefix;
+            } else if (std.mem.eql(u8, d.tag.handle, "!!")) {
+                table.secondary = d.tag.prefix;
+            } else {
+                table.named[table.count] = .{ .handle = d.tag.handle, .prefix = d.tag.prefix };
+                table.count += 1;
+            }
         }
+        return table;
     }
-    if (named) |form| return form;
-    for ([_][2][]const u8{ .{ "!!", secondary }, .{ "!", primary } }) |pair| {
-        if (pair[1].len < tag.len and std.mem.startsWith(u8, tag, pair[1]))
-            return .{ .shorthand = .{ .handle = pair[0], .suffix = tag[pair[1].len..] } };
+
+    /// Chooses a form that reads back as `tag`, or fails if there is none.
+    pub fn form(self: *const TagTable, tag: []const u8) error{InvalidTag}!TagForm {
+        if (tag.len == 0 or !std.unicode.utf8ValidateSlice(tag)) return error.InvalidTag;
+        if (std.mem.eql(u8, tag, "!")) return .non_specific;
+        var best: ?Handle = null;
+        for (self.named[0..self.count]) |h| {
+            if ((best == null or h.prefix.len > best.?.prefix.len) and h.prefix.len < tag.len and std.mem.startsWith(u8, tag, h.prefix))
+                best = h;
+        }
+        if (best) |h| return .{ .shorthand = .{ .handle = h.handle, .suffix = tag[h.prefix.len..] } };
+        for ([_]Handle{ .{ .handle = "!!", .prefix = self.secondary }, .{ .handle = "!", .prefix = self.primary } }) |h| {
+            if (h.prefix.len < tag.len and std.mem.startsWith(u8, tag, h.prefix))
+                return .{ .shorthand = .{ .handle = h.handle, .suffix = tag[h.prefix.len..] } };
+        }
+        if (isVerbatimTag(tag)) return .{ .verbatim = tag };
+        return error.InvalidTag;
     }
-    if (isVerbatimTag(tag)) return .{ .verbatim = tag };
-    return error.InvalidTag;
-}
+};
 
 /// Writes `form`, escaping what a suffix cannot hold as `%XX`.
 pub fn writeTag(w: *std.Io.Writer, form: TagForm) std.Io.Writer.Error!void {

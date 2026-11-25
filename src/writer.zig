@@ -48,7 +48,7 @@ pub const Doc = struct {
 /// Writes one document on its own. Its end needs no marker.
 pub fn write(w: *Writer, doc: Doc) Error!void {
     try check(doc);
-    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1), .directives = doc.directives };
+    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1), .tags = try model.TagTable.init(doc.directives) };
     try g.document(doc, doc.explicit_start or doc.directives.len != 0);
 }
 
@@ -56,21 +56,22 @@ pub fn write(w: *Writer, doc: Doc) Error!void {
 /// the output itself. Values and keys can be built by hand, so nothing is
 /// written before the whole tree has passed.
 pub fn check(doc: Doc) CheckError!void {
-    var checker: Checker = .{ .gpa = doc.gpa, .directives = doc.directives };
+    for (doc.directives) |line| _ = model.parseDirective(line) catch return error.InvalidDirective;
+    const tags = try model.TagTable.init(doc.directives);
+    var checker: Checker = .{ .gpa = doc.gpa, .tags = &tags };
     defer checker.anchors.deinit(doc.gpa);
     try checker.tree(doc.root, doc.max_depth, false);
     try checkComment(.{ .before = doc.header });
     try checkComment(.{ .before = doc.footer });
     try checkComment(doc.root_comments);
     try checkComment(.{ .after = doc.start_comment });
-    for (doc.directives) |line| _ = model.parseDirective(line) catch return error.InvalidDirective;
 }
 
 /// Writes the next document of a stream; `check` it first. `previous_ended`
 /// says whether the one before was closed with `...`, and `next` is the one
 /// that follows. Returns whether this one was closed.
 pub fn writeInStream(w: *Writer, doc: Doc, index: usize, previous_ended: bool, next: ?Doc) Error!bool {
-    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1), .directives = doc.directives, .drop_blank = index == 0 };
+    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1), .tags = try model.TagTable.init(doc.directives), .drop_blank = index == 0 };
     // Only `---` or `...` keeps two documents apart.
     const start = doc.explicit_start or doc.directives.len != 0 or (index != 0 and !previous_ended);
     try g.document(doc, start);
@@ -94,7 +95,7 @@ fn checkComment(c: Comments) error{InvalidUtf8}!void {
 /// Walks the tree in the order it is written.
 const Checker = struct {
     gpa: Allocator,
-    directives: []const []const u8,
+    tags: *const model.TagTable,
     /// What each anchor name stands for at this point of the output.
     anchors: std.StringHashMapUnmanaged(Definition) = .empty,
 
@@ -111,7 +112,7 @@ const Checker = struct {
             if (!sameNode(found.node, v.alias.value) or (in_key and found.open)) return error.BrokenAlias;
             return;
         }
-        if (tagOf(v)) |tag| _ = try model.tagForm(tag, self.directives);
+        if (tagOf(v)) |tag| _ = try self.tags.form(tag);
         const anchor = v.anchorOf();
         if (anchor) |a| {
             if (!model.isAnchorName(a.name)) return error.InvalidAnchor;
@@ -208,8 +209,8 @@ fn isInline(v: Value) bool {
 const Gen = struct {
     w: *Writer,
     step: usize,
-    /// The document's directives, which tag shorthands depend on.
-    directives: []const []const u8,
+    /// The document's tag handles, which tag shorthands depend on.
+    tags: model.TagTable,
     /// Set where empty comment lines must be left out: at the start of the
     /// output (the reader drops them, so a second write would differ) and
     /// after a block scalar with keep chomping (they would join its value).
@@ -309,7 +310,7 @@ const Gen = struct {
         if (tagOf(v)) |tag| {
             if (v.anchorOf() != null) try self.w.writeByte(' ');
             // `check` has made sure there is a form.
-            try model.writeTag(self.w, model.tagForm(tag, self.directives) catch return error.InvalidTag);
+            try model.writeTag(self.w, self.tags.form(tag) catch return error.InvalidTag);
         }
     }
 

@@ -1521,3 +1521,39 @@ test "a block scalar cut off by the end of input has no final line break" {
     defer back.deinit();
     try testing.expectEqualStrings("x", back.root.map.getString("a").?);
 }
+
+test "tag prefixes cannot be used to multiply memory" {
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    try src.appendSlice(testing.allocator, "%TAG !e! x:");
+    try src.appendNTimes(testing.allocator, 'p', 100_000);
+    try src.appendSlice(testing.allocator, "\n---\n");
+    for (0..1_000) |_| try src.appendSlice(testing.allocator, "- !e!a v\n");
+    // 100 KB, a thousand times over, is past the 16 MiB default.
+    try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, src.items, .{}, null));
+    // The limit counts the whole stream.
+    const opts: yaml.Options = .{ .max_bytes = 60 };
+    var fits = try yaml.Stream.parse(testing.allocator, "%TAG !e! x:abcdefghijklmnopq\n--- !e!a\n", opts, null);
+    fits.deinit();
+    try testing.expectError(error.LimitExceeded, yaml.Stream.parse(testing.allocator, "%TAG !e! x:abcdefghijklmnopqrstuv\n--- [!e!a , !e!b , !e!c ]\n", opts, null));
+}
+
+test "a document has at most 64 %TAG directives" {
+    var src: std.ArrayList(u8) = .empty;
+    defer src.deinit(testing.allocator);
+    for (0..64) |i| try src.print(testing.allocator, "%TAG !h{d}! x:{d}:\n", .{ i, i });
+    const end = "--- !h63!t v\n";
+    try src.appendSlice(testing.allocator, end);
+    var doc = try parse(src.items);
+    defer doc.deinit();
+    var back = try writeAndRead(&doc);
+    defer back.deinit();
+    try expectSame(doc.root, back.root);
+
+    src.shrinkRetainingCapacity(src.items.len - end.len);
+    try src.appendSlice(testing.allocator, "%TAG !h64! x:\n--- v\n");
+    try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, src.items, .{}, null));
+    var lines: [65][]const u8 = @splat("%TAG !a! x:");
+    doc.directives = &lines;
+    try testing.expectError(error.InvalidDirective, doc.toOwnedString(testing.allocator));
+}

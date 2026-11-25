@@ -48,7 +48,8 @@ pub const Error = error{
 pub const Options = struct {
     /// Maximum nesting of collections. Bounds recursion depth.
     max_depth: u32 = 64,
-    /// Maximum input size in bytes.
+    /// Maximum input size in bytes. It also limits the total length of the tag
+    /// names that `%TAG` prefixes expand to.
     max_bytes: usize = 16 * 1024 * 1024,
 };
 
@@ -188,6 +189,10 @@ const Parser = struct {
     anchors: std.StringHashMapUnmanaged(*Anchor) = .empty,
     /// The current document's `%TAG` handles and their prefixes.
     handles: std.StringHashMapUnmanaged([]const u8) = .empty,
+    /// Bytes of tag names built so far in the stream. A long `%TAG` prefix is
+    /// copied for each tag that uses it, so their total is limited like the
+    /// input is, by `Options.max_bytes`.
+    tag_bytes: usize = 0,
     /// Where the text of one scalar is put together before it is copied to the
     /// arena. Reused, so that a document with many scalars does not allocate
     /// and free a buffer for each.
@@ -375,6 +380,7 @@ const Parser = struct {
                         const slot = try self.handles.getOrPut(self.a, try self.a.dupe(u8, t.handle));
                         if (slot.found_existing) return self.err("a second %TAG directive for one handle");
                         slot.value_ptr.* = try self.a.dupe(u8, t.prefix);
+                        if (self.handles.count() > model.max_tag_directives) return self.fail("too many %TAG directives", error.LimitExceeded);
                     },
                     .reserved => {},
                 }
@@ -702,6 +708,8 @@ const Parser = struct {
                     "!"
                 else
                     return null;
+                self.tag_bytes +|= prefix.len + suffix.len;
+                if (self.tag_bytes > self.options.max_bytes) return self.failHere(s, "tag names too large", error.LimitExceeded);
                 name = try model.expandTag(self.a, prefix, suffix) orelse return null;
             }
         }
