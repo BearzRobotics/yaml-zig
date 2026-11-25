@@ -174,24 +174,34 @@ const Parser = struct {
     fn document(self: *Parser) Error!Result {
         var res: Result = .{ .root = null_scalar, .indent = 2, .explicit_start = false, .header = &.{}, .footer = &.{} };
         try self.skipBlank();
+        // Content that shares its line with `---`.
+        var inline_root: ?[]const u8 = null;
         if (try self.cur()) |c| {
-            if (std.mem.eql(u8, c.content, "---")) {
+            if (isDocMarker(c) and c.content[0] == '-') {
                 res.explicit_start = true;
                 if (self.pending.items.len != 0) res.header = try self.a.dupe([]const u8, self.pending.items);
                 self.pending.clearRetainingCapacity();
-                self.pos += 1;
-            } else if (c.content.len != 0 and c.content[0] == '%') return self.unsupported("directives are not supported");
+                const rest = std.mem.trimStart(u8, self.lines[self.pos][3..], " \t");
+                if (rest.len == 0 or rest[0] == '#') self.pos += 1 else inline_root = rest;
+            } else if (c.indent == 0 and c.content[0] == '%') return self.unsupported("directives are not supported");
         }
-        res.root = try self.block(-1);
+        if (inline_root) |rest| {
+            const content = std.mem.trimEnd(u8, splitComment(rest).content, " \t");
+            if (isSeqEntry(content) or try self.splitKey(content) != null)
+                return self.err("a block collection cannot start on the '---' line");
+            res.root = try self.scalarAt(rest, -1);
+        } else res.root = try self.block(-1);
         try self.skipBlank();
         if (try self.cur()) |c| {
-            if (std.mem.eql(u8, c.content, "...")) {
+            if (!isDocMarker(c)) return self.err("unexpected content or bad indentation");
+            if (c.content[0] == '-') return self.unsupported("several documents are not supported");
+            // `...` ends the document. It may be repeated.
+            while (try self.cur()) |end| {
+                if (!isDocMarker(end) or end.content[0] != '.') return self.unsupported("several documents are not supported");
+                if (end.content.len != 3) return self.err("unexpected content after '...'");
                 self.pos += 1;
                 try self.skipBlank();
-                if (self.pos < self.lines.len) return self.unsupported("several documents are not supported");
-            } else if (std.mem.startsWith(u8, c.content, "---")) {
-                return self.unsupported("several documents are not supported");
-            } else return self.err("unexpected content or bad indentation");
+            }
         }
         var n = self.pending.items.len;
         while (n > 0 and self.pending.items[n - 1].len == 0) n -= 1;
@@ -228,10 +238,7 @@ const Parser = struct {
 
     /// `---` or `...` at the start of a line ends or starts a document.
     fn isDocMarker(c: Cur) bool {
-        if (c.indent != 0 or c.content.len < 3) return false;
-        const m = c.content[0..3];
-        if (!std.mem.eql(u8, m, "---") and !std.mem.eql(u8, m, "...")) return false;
-        return c.content.len == 3 or c.content[3] == ' ';
+        return c.indent == 0 and isForbidden(c.content);
     }
 
     fn isSeqEntry(content: []const u8) bool {
@@ -433,7 +440,7 @@ const Parser = struct {
             if (j >= self.lines.len) break;
             const l = self.lines[j];
             const ind = indentOf(l);
-            if (@as(i64, @intCast(ind)) <= parent or l[ind] == '#') break;
+            if (@as(i64, @intCast(ind)) <= parent or l[ind] == '#' or isForbidden(l)) break;
             const part = splitComment(l[ind..]);
             const t = std.mem.trim(u8, part.content, " \t");
             if (std.mem.indexOf(u8, t, ": ") != null or std.mem.endsWith(u8, t, ":") or isSeqEntry(t) or (t.len > 0 and (t[0] == '"' or t[0] == '\'' or t[0] == '[' or t[0] == '{' or t[0] == '|' or t[0] == '>')))
@@ -473,6 +480,7 @@ const Parser = struct {
         while (end < self.lines.len) : (end += 1) {
             const l = self.lines[end];
             if (isBlank(l)) continue;
+            if (isForbidden(l)) break;
             const ind = indentOf(l);
             if (content_indent == null) {
                 if (ind < floor) break;

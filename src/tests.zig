@@ -350,3 +350,38 @@ test "max_depth counts block and flow nesting together" {
     try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, "a:\n  b: [[1]]\n", opts, null));
     try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, "[[[[]]]]\n", opts, null));
 }
+
+test "document markers end scalars" {
+    var a = try parse("foo\n...\n");
+    defer a.deinit();
+    try testing.expectEqualStrings("foo", a.root.scalar.text);
+    var b = try parse("|\nx\n...\n");
+    defer b.deinit();
+    try testing.expectEqualStrings("x\n", b.root.scalar.text);
+    try rejects("foo\n---\nbar\n", error.Unsupported);
+    try rejects("---\nscalar\n...\nkey: value\n", error.Unsupported);
+    try rejects("|\nx\n...\ny\n", error.Unsupported);
+    try rejects("  ---\na: 1\n", error.Syntax);
+    try rejects("a: 1\n... x\n", error.Syntax);
+    var c = try parse("a: 1\n...\n# c\n...\n");
+    c.deinit();
+    // Only a marker followed by a blank or nothing is a marker.
+    try expectString("a: x\n  ---y\n", "x ---y");
+}
+
+test "content on the '---' line" {
+    const cases = [_][2][]const u8{
+        .{ "--- foo\n", "foo" },
+        .{ "---\tscalar\n", "scalar" },
+        .{ "--- |\n  text\n", "text\n" },
+        .{ "--- \"q\"\n", "q" },
+    };
+    for (cases) |case| {
+        var doc = try parse(case[0]);
+        defer doc.deinit();
+        try testing.expect(doc.explicit_start);
+        try testing.expectEqualStrings(case[1], doc.root.scalar.text);
+    }
+    try rejects("--- a: 1\n", error.Syntax);
+    try rejects("--- - a\n", error.Syntax);
+}
