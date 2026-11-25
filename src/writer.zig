@@ -215,6 +215,8 @@ const Gen = struct {
     /// output (the reader drops them, so a second write would differ) and
     /// after a block scalar with keep chomping (they would join its value).
     drop_blank: bool = true,
+    /// The last comment line written was empty. The reader keeps one of a run.
+    blank_written: bool = false,
 
     fn document(self: *Gen, doc: Doc, start: bool) Error!void {
         try self.lines(doc.header, 0);
@@ -255,6 +257,7 @@ const Gen = struct {
     /// Starts a line that is not empty.
     fn pad(self: *Gen, n: usize) Error!void {
         self.drop_blank = false;
+        self.blank_written = false;
         try self.w.splatByteAll(' ', n);
     }
 
@@ -264,8 +267,8 @@ const Gen = struct {
             // setComments could place the line inside a block scalar above, or
             // put a tab where an indent belongs.
             const l = std.mem.trimStart(u8, line, " \t");
-            if (l.len == 0 and self.drop_blank) continue;
-            if (l.len != 0) try self.pad(indent);
+            if (l.len == 0 and (self.drop_blank or self.blank_written)) continue;
+            if (l.len != 0) try self.pad(indent) else self.blank_written = true;
             try self.w.writeAll(l);
             try self.w.writeByte('\n');
         }

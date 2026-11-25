@@ -535,14 +535,22 @@ const Parser = struct {
         if (props.any() and endsLine(props.rest)) {
             // Properties on a line of their own belong to what follows. A node
             // has at most one of each, so this does not recurse far.
-            if (try self.commentOn(props.rest)) |text| try self.pending.append(self.gpa, text);
+            const comment = try self.commentOn(props.rest);
             const both = try self.merge(outer, props);
             self.pos += 1;
             const above = self.pending.items.len;
             try self.skipBlank();
             if (!try self.nodeFollows(parent, sequence_at_parent)) {
+                // Nothing follows: the node is empty and the comment is its own.
                 self.own_pending = above;
+                self.trailing = comment;
                 return self.emptyNode(both);
+            }
+            // Otherwise it is a line above the node's first item. It goes in
+            // before the lines that follow it. The source line has it.
+            if (comment != null) {
+                const line = std.mem.trimEnd(u8, props.rest, " \t");
+                try self.pending.insert(self.gpa, above, line);
             }
             return self.block(parent, under, both, sequence_at_parent);
         }
@@ -752,19 +760,30 @@ const Parser = struct {
 
     /// A key's hash is taken as it goes in, so what it refers to must be whole.
     fn checkKey(self: *Parser, key: Value, column: usize) Error!void {
-        if (holdsOpenAlias(key))
+        if (holdsOpenAlias(key, null))
             return failAt(self.diag, self.pos + 1, column, "a key cannot hold an alias of a node that holds the key", error.Unsupported);
     }
 
-    fn holdsOpenAlias(v: Value) bool {
+    /// The anchored nodes of a key that the walk through it is inside.
+    const Around = struct { anchor: *const Anchor, next: ?*const Around };
+
+    /// Whether `v` holds an alias of a node still being read, or of a node of
+    /// its own that holds the alias.
+    fn holdsOpenAlias(v: Value, around: ?*const Around) bool {
+        const link: Around = .{ .anchor = v.anchorOf() orelse undefined, .next = around };
+        const inside = if (v.anchorOf() != null) &link else around;
         switch (v) {
-            .alias => |a| return !a.complete,
+            .alias => |a| {
+                var step = around;
+                while (step) |s| : (step = s.next) if (s.anchor == a) return true;
+                return !a.complete;
+            },
             .scalar => return false,
             .seq => |q| for (q.items.items) |item| {
-                if (holdsOpenAlias(item)) return true;
+                if (holdsOpenAlias(item, inside)) return true;
             },
             .map => |m| for (m.entries.keys(), m.entries.values()) |k, e| {
-                if (holdsOpenAlias(k) or holdsOpenAlias(e.value)) return true;
+                if (holdsOpenAlias(k, inside) or holdsOpenAlias(e.value, inside)) return true;
             },
         }
         return false;

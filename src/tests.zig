@@ -1557,3 +1557,19 @@ test "a document has at most 64 %TAG directives" {
     doc.directives = &lines;
     try testing.expectError(error.InvalidDirective, doc.toOwnedString(testing.allocator));
 }
+
+test "a key cannot hold an alias that leads back into it" {
+    for ([_][]const u8{ "? &a [*a]\n", "&a [*a]: x\n", "? [&b {k: *b}]\n: 1\n", "{&c [[*c]]: 1}\n", "? - &d\n    - *d\n" }) |src| {
+        try rejects(src, error.Unsupported);
+    }
+    // An alias of a finished node inside the same key is fine.
+    try roundTrips("[&a x, *a]: 1\n");
+}
+
+test "comments on a property line, and runs of empty lines, are stable" {
+    try expectStable("---    !t  # c3\n", "---\n!t # c3\n");
+    try expectStable("--- &b # c.\r", "---\n&b # c.\n");
+    try expectStable("a:\n  &x # c\nb: 1\n", "a: &x # c\nb: 1\n");
+    try expectStable("!t # on the tag\n# above a\na: 1\n", "!t\n# on the tag\n# above a\na: 1\n");
+    try expectStable(" # c3\n\n- \n    \n  j: &a \n", "# c3\n\n- j: &a\n");
+}
