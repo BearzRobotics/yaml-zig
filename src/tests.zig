@@ -502,3 +502,18 @@ test "bad block scalars are rejected" {
     try expectString("a: |2-\n  x\n", "x");
     try expectString("a: |-2 # c\n  x\n", "x");
 }
+
+test "double-quoted escapes" {
+    try expectString("a: \"\\0\\a\\b\\t\\n\\v\\f\\r\\e\\ \\\"\\/\\\\\"\n", "\x00\x07\x08\t\n\x0b\x0c\r\x1b \"/\\");
+    try expectString("a: \"\\N\\_\\L\\P\"\n", "\u{85}\u{a0}\u{2028}\u{2029}");
+    try expectString("a: \"\\x41\\u00e9\\U0001F600\"\n", "A\u{e9}\u{1F600}");
+    for ([_][]const u8{ "a: \"\\x+1\"\n", "a: \"\\u1_00\"\n", "a: \"\\x4\"\n", "a: \"\\uD800\"\n", "a: \"\\U00110000\"\n", "a: \"\\q\"\n" }) |src| {
+        try rejects(src, error.Syntax);
+    }
+}
+
+test "escaped line breaks" {
+    try expectString("a: \"foo \\\n  bar\"\n", "foo bar");
+    try expectString("a: \"foo \\\n  \n  bar\"\n", "foo \nbar");
+    try expectString("a: \"x\\t\\\n\n\n  y\"\n", "x\t\n\ny");
+}

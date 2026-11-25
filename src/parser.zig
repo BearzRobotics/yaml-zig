@@ -676,6 +676,7 @@ const Parser = struct {
                 }
                 i -= 1;
                 if (blanks == 0) try out.append(self.a, ' ') else try out.appendNTimes(self.a, '\n', blanks);
+                keep = out.items.len;
                 continue;
             }
             if (!double) {
@@ -710,16 +711,24 @@ const Parser = struct {
                 'x', 'u', 'U' => {
                     const n: usize = if (body[i] == 'x') 2 else if (body[i] == 'u') 4 else 8;
                     if (i + 1 + n > body.len) return self.err("bad escape in a double-quoted scalar");
-                    const cp = std.fmt.parseInt(u21, body[i + 1 .. i + 1 + n], 16) catch return self.err("bad escape in a double-quoted scalar");
+                    const digits = body[i + 1 .. i + 1 + n];
+                    // `parseInt` alone would also take a sign and underscores.
+                    for (digits) |d| if (!std.ascii.isHex(d)) return self.err("bad escape in a double-quoted scalar");
+                    const cp = std.fmt.parseInt(u21, digits, 16) catch return self.err("bad escape in a double-quoted scalar");
                     var buf: [4]u8 = undefined;
                     const len = std.unicode.utf8Encode(cp, &buf) catch return self.err("bad escape in a double-quoted scalar");
                     try out.appendSlice(self.a, buf[0..len]);
                     i += n;
                 },
                 '\n' => {
-                    // An escaped line break joins the lines without a space.
-                    while (i + 1 < body.len and (body[i + 1] == ' ' or body[i + 1] == '\t')) i += 1;
-                    continue;
+                    // An escaped line break joins the lines without a space,
+                    // keeping the blanks before the backslash. Each empty line
+                    // after it is still a line feed.
+                    while (i + 1 < body.len) : (i += 1) {
+                        if (body[i + 1] == '\n') {
+                            try out.append(self.a, '\n');
+                        } else if (!isWhite(body[i + 1])) break;
+                    }
                 },
                 else => return self.err("unknown escape in a double-quoted scalar"),
             }
