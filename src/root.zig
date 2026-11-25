@@ -95,13 +95,14 @@ pub const Document = struct {
 
     /// A string scalar, quoted if it would otherwise read as something else
     /// (`"true"`, `"12"`, `""`), as a literal block if it has several lines.
-    pub fn string(self: *Document, s: []const u8) Allocator.Error!Value {
+    pub fn string(self: *Document, s: []const u8) (Allocator.Error || error{InvalidUtf8})!Value {
+        if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
         const text = try self.dupe(s);
         if (std.mem.indexOfScalar(u8, s, '\n') != null) {
             const ok = for (s) |c| {
                 if (c != '\n' and c != '\t' and (c < 0x20 or c == 0x7F)) break false;
             } else true;
-            if (ok and std.unicode.utf8ValidateSlice(s)) return .{ .scalar = .{ .text = text, .style = .literal, .kind = .string } };
+            if (ok) return .{ .scalar = .{ .text = text, .style = .literal, .kind = .string } };
         }
         return .{ .scalar = .{ .text = text, .style = .plain, .kind = .string } };
     }
@@ -133,13 +134,14 @@ pub const Document = struct {
 
     // ---- paths -----------------------------------------------------------------------
 
-    pub const PathError = Allocator.Error || error{ NotACollection, NotFound };
+    pub const PathError = Allocator.Error || error{ NotACollection, NotFound, InvalidUtf8 };
 
     /// Sets the value at `path` (mapping keys; a number indexes a sequence),
     /// creating missing mappings on the way. Replacing a value keeps its
     /// comments. Values must be arena-owned: build them with the methods above.
     pub fn set(self: *Document, path: []const []const u8, v: Value) PathError!void {
         std.debug.assert(path.len > 0);
+        for (path) |seg| if (!std.unicode.utf8ValidateSlice(seg)) return error.InvalidUtf8;
         const a = self.allocator();
         var cur = self.root;
         for (path[0 .. path.len - 1]) |seg| {
@@ -224,10 +226,14 @@ pub const Document = struct {
     }
 
     /// Returns the YAML text; caller frees with `gpa`.
-    pub fn toOwnedString(self: *const Document, gpa: Allocator) (Allocator.Error || error{WriteFailed})![]u8 {
+    pub fn toOwnedString(self: *const Document, gpa: Allocator) (Allocator.Error || error{ WriteFailed, InvalidUtf8 })![]u8 {
         var aw: std.Io.Writer.Allocating = .init(gpa);
         errdefer aw.deinit();
-        self.write(&aw.writer) catch return error.OutOfMemory;
+        self.write(&aw.writer) catch |e| switch (e) {
+            // An allocating writer fails only when it cannot grow.
+            error.WriteFailed => return error.OutOfMemory,
+            error.InvalidUtf8 => return error.InvalidUtf8,
+        };
         return aw.toOwnedSlice();
     }
 };

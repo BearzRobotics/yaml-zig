@@ -20,7 +20,7 @@ const Seq = model.Seq;
 const Map = model.Map;
 const Comments = model.Comments;
 
-pub const Error = Writer.Error;
+pub const Error = Writer.Error || error{InvalidUtf8};
 
 pub const Doc = struct {
     root: Value,
@@ -31,6 +31,11 @@ pub const Doc = struct {
 };
 
 pub fn write(w: *Writer, doc: Doc) Error!void {
+    // Values and keys can be built by hand, so the whole tree is checked
+    // before anything is written.
+    try checkUtf8(doc.root);
+    try checkComment(.{ .before = doc.header });
+    try checkComment(.{ .before = doc.footer });
     var g: Gen = .{ .w = w, .step = @max(doc.indent, 1) };
     try g.lines(doc.header, 0);
     if (doc.explicit_start) try w.writeAll("---\n");
@@ -44,6 +49,32 @@ pub fn write(w: *Writer, doc: Doc) Error!void {
         .scalar => try g.rootInline(doc.root),
     }
     try g.lines(doc.footer, 0);
+}
+
+fn checkText(s: []const u8) error{InvalidUtf8}!void {
+    if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
+}
+
+fn checkComment(c: Comments) error{InvalidUtf8}!void {
+    for (c.before) |l| try checkText(l);
+    if (c.after) |a| try checkText(a);
+}
+
+fn checkUtf8(v: Value) error{InvalidUtf8}!void {
+    switch (v) {
+        .scalar => |s| try checkText(s.text),
+        .seq => |q| {
+            for (q.items.items) |item| try checkUtf8(item);
+            for (q.comments.items) |c| try checkComment(c);
+        },
+        .map => |m| {
+            for (m.entries.keys(), m.entries.values()) |k, item| {
+                try checkText(k);
+                try checkUtf8(item);
+            }
+            for (m.comments.values()) |c| try checkComment(c);
+        },
+    }
 }
 
 const Gen = struct {

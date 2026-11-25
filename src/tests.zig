@@ -544,3 +544,17 @@ test "text that looks like a document marker is quoted at column 0" {
     // Away from column 0 it stays as it was written.
     try roundTrips("a: ...\n");
 }
+
+test "invalid UTF-8 is refused, not written" {
+    var doc = try yaml.Document.init(testing.allocator);
+    defer doc.deinit();
+    try testing.expectError(error.InvalidUtf8, doc.string("a\xffb"));
+    try testing.expectError(error.InvalidUtf8, doc.set(&.{"a\xffb"}, doc.boolean(true)));
+    try testing.expectEqual(@as(usize, 0), doc.root.map.count());
+    // Values and comments built by hand are caught when writing.
+    try doc.set(&.{"a"}, .{ .scalar = .{ .text = "\xff" } });
+    try testing.expectError(error.InvalidUtf8, doc.toOwnedString(testing.allocator));
+    try doc.set(&.{"a"}, doc.boolean(true));
+    doc.footer = &.{"# \xff"};
+    try testing.expectError(error.InvalidUtf8, doc.toOwnedString(testing.allocator));
+}
