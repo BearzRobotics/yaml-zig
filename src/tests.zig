@@ -226,7 +226,6 @@ test "strings that need quoting are quoted" {
 
 test "unsupported and invalid input is rejected" {
     try rejects("a: *x\n", error.Syntax);
-    try rejects("? a\n: b\n", error.Unsupported);
     try rejects("a: 1\n---\nb: 2\n", error.Unsupported);
     try rejects("a: 1\na: 2\n", error.Syntax);
     try rejects("a: 1\n  b: 2\n", error.Syntax);
@@ -307,6 +306,7 @@ test "no leaks or swallowed errors on allocation failure" {
     try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "# nothing\n")});
     try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "%TAG !e! x:\n--- !e!a\n!!str k: !<a:b> [!c v]\nl:\n  !t\n  # c\n  - !!int 1\n")});
     try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{@as([]const u8, "a: &a [1, *a, &b x]\nb: *b\n&c key: &d\n  *c : *d\n")});
+    try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{@as([]const u8, "? [a, {b: c}]\n# x\n: - d\n? |\n  e\n: f\n{g: h}: i\n")});
     try testing.checkAllAllocationFailures(testing.allocator, buildAndEdit, .{});
     try testing.checkAllAllocationFailures(testing.allocator, readAll, .{});
 }
@@ -331,7 +331,7 @@ test "random bytes never crash the parser" {
 // tree, and writing that again gives the same text. The input is random
 // strings of YAML's own tokens, so that much of it parses.
 test "every accepted input survives writing" {
-    const tokens = [_][]const u8{ "&a ", "*a", "*a ", "&b", "&a", "!", "!!str ", "!!int", "!t ", "!<a:b> ", "!e!x ", "! ", "a", "b", ":", " ", " ", " ", "  ", "\n", "\n", "\n", "- ", "-", "#", " # c", "\"", "'", "[", "]", "{", "}", ",", "|", ">", "+", "2", ".", "...", "---", "\\", "\t", "k: ", "x", "\r", "?", "&", "true", "null", "\\n", "|2", ">-", "\n  ", "\n- ", ": ", "\u{85}", "\u{7f}" };
+    const tokens = [_][]const u8{ "? ", "\n? ", "\n: ", "[a]: ", "&a ", "*a", "*a ", "&b", "&a", "!", "!!str ", "!!int", "!t ", "!<a:b> ", "!e!x ", "! ", "a", "b", ":", " ", " ", " ", "  ", "\n", "\n", "\n", "- ", "-", "#", " # c", "\"", "'", "[", "]", "{", "}", ",", "|", ">", "+", "2", ".", "...", "---", "\\", "\t", "k: ", "x", "\r", "?", "&", "true", "null", "\\n", "|2", ">-", "\n  ", "\n- ", ": ", "\u{85}", "\u{7f}" };
     var prng = std.Random.DefaultPrng.init(1);
     const rnd = prng.random();
     var buf: std.ArrayList(u8) = .empty;
@@ -472,9 +472,6 @@ test "invalid flow collections are rejected" {
     try rejects("[\n--- ,\n...\n]\n", error.Syntax);
     try rejects("a: [x\n  y: z]\n", error.Syntax);
     try rejects("a: {x: 1, x: 2}\n", error.Syntax);
-    try rejects("a: {? x: 1}\n", error.Unsupported);
-    try rejects("a: {[b]: c}\n", error.Unsupported);
-    try rejects("[b]: c\n", error.Unsupported);
 }
 
 test "max_depth counts block and flow nesting together" {
@@ -528,7 +525,6 @@ test "properties and reserved indicators on keys are not read as text" {
     try testing.expectEqualStrings("v", doc.root.map.getString("key").?);
     try testing.expectEqualStrings("key", doc.root.map.getString("other").?);
     try rejects("*a : 1\n", error.Syntax);
-    try rejects("?\ta\n", error.Unsupported);
     try rejects("@a: 1\n", error.Syntax);
     try rejects("`a: 1\n", error.Syntax);
     try rejects("%a: 1\nb: 2\n", error.Syntax); // a directive without its `---`
@@ -1434,4 +1430,80 @@ test "anchors and aliases made through the API" {
     try testing.expectEqualStrings("first: &s\n  k: 1\nsecond: *s\n", out);
     anchor.name = "not a name";
     try testing.expectError(error.InvalidAnchor, doc.toOwnedString(testing.allocator));
+}
+
+test "explicit keys" {
+    try expectStable("? a\n: 1\n? b\nc: 2\n", "a: 1\nb:\nc: 2\n");
+    try expectStable("? - a\n  - b\n: - c\n", "?\n  - a\n  - b\n:\n  - c\n");
+    try expectStable("?\n- a\n:\n- b\n", "?\n  - a\n:\n  - b\n");
+    try expectStable("- ? k: v\n  : w\n", "- ?\n    k: v\n  : w\n");
+    try roundTrips("? |\n  block\n  key\n: value\n");
+    try roundTrips("? !t\n  - &a x\n: *a\n");
+    try roundTrips("- ?\n    a: 1\n  : 2\n");
+    var doc = try parse("? [x, y]\n: pair\n? {a: 1}\n: map\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("x", doc.root.map.keys()[0].seq.items.items[0].scalar.text);
+    try testing.expectEqualStrings("pair", doc.root.map.entries.values()[0].value.scalar.text);
+}
+
+test "collections as keys" {
+    try roundTrips("[a, b]: c\n{d: e}: f\n[]: g\n&k [h]: *k\n!t {i: j}: l\n");
+    try roundTrips("a: {[b]: c, {d: [e]}: f}\n");
+    try expectStable("[ [a]: b, \"c\":d, {e: f}:g ]\n", "[{[a]: b}, {\"c\": d}, {{e: f}: g}]\n");
+    // A key is found again by its value, however it is written.
+    try rejects("[a, b]: 1\n? - a\n  - b\n: 2\n", error.Syntax);
+    try rejects("{a: 1, b: 2}: x\n{b: 2, a: 0x1}: y\n", error.Syntax);
+    var different = try parse("{a: 1}: x\n{a: \"1\"}: y\n[1]: z\n!t [1]: w\n");
+    defer different.deinit();
+    try testing.expectEqual(@as(usize, 4), different.root.map.count());
+    try testing.expectEqualStrings("y", different.root.map.getValue(different.root.map.keys()[1]).?.scalar.text);
+}
+
+test "explicit entries in flow collections" {
+    try expectStable("{? a: b, ? c, d: e}\n", "{a: b, c: null, d: e}\n");
+    try expectStable("[? a\n  b : c]\n", "[{a b: c}]\n");
+    try expectStable("[? d]\n", "[{d: null}]\n");
+}
+
+test "comments around an explicit entry are kept" {
+    try expectStable("# above\n? a # key\n# between\n: b # value\nz: 1\n", "# above\n# key\n# between\na: b # value\nz: 1\n");
+    try expectStable("? a # key\nz: 1\n", "a: # key\nz: 1\n");
+    try expectStable("? - a\n  # inside\n  - b\n: c\n", "?\n  - a\n  # inside\n  - b\n: c\n");
+}
+
+test "bad complex keys are rejected" {
+    for ([_][]const u8{
+        "? a\n : b\n",         "[a,\n b]: c\n", "a: [b]: c\n",   "a: ? b\n", "--- ? a\n",
+        "&x ? a\n",            "?\t- a\n",      "? a\n:\t- b\n", "[a]:b\n",  "a: 1\n[b]\n",
+        "[? a\n: b, : : c]\n",
+    }) |src| {
+        errdefer std.debug.print("source: {s}\n", .{src});
+        try rejects(src, error.Syntax);
+    }
+}
+
+test "a long key is written in the '?' form" {
+    var doc = try yaml.Document.init(testing.allocator);
+    defer doc.deinit();
+    const long: [1100]u8 = @splat('k');
+    try doc.set(&.{&long}, try doc.integer(1));
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.startsWith(u8, out, "? kkk"));
+    var back = try parse(out);
+    defer back.deinit();
+    try testing.expectEqual(@as(?i64, 1), back.root.map.getInt(&long));
+}
+
+test "collection keys count towards max_depth" {
+    const opts: yaml.Options = .{ .max_depth = 2 };
+    for ([_][]const u8{ "[a]: 1\n", "? - a\n: 1\n", "{[a]: 1}\n" }) |src| {
+        var doc = try yaml.Document.parse(testing.allocator, src, opts, null);
+        defer doc.deinit();
+        const out = try doc.toOwnedString(testing.allocator);
+        testing.allocator.free(out);
+    }
+    for ([_][]const u8{ "[[a]]: 1\n", "x: 0\n[[a]]: 1\n", "? - - a\n: 1\n", "{[[a]]: 1}\n", "[[a]: 1]\n" }) |src| {
+        try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, src, opts, null));
+    }
 }

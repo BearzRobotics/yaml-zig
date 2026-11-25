@@ -30,6 +30,7 @@ const max_file = 1 << 20;
 /// 3.2.1.1), and this library reports a repeat as malformed.
 const rejected_on_purpose = [_]struct { case: []const u8, why: []const u8 }{
     .{ .case = "2JQS", .why = "two empty keys in one mapping" },
+    .{ .case = "X38W", .why = "a key and an alias of it in one mapping, which are the same node" },
 };
 
 const Outcome = enum { pass, unsupported, on_purpose, rejected_valid, wrong_structure, wrong_value, bad_round_trip, accepted_invalid };

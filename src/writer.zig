@@ -166,6 +166,16 @@ fn hasProps(v: Value) bool {
     return tagOf(v) != null or v.anchorOf() != null;
 }
 
+/// A key that cannot stand before a `:` on its line: a block collection, a
+/// block scalar, or one longer than the 1024 characters YAML allows there.
+fn needsExplicitKey(k: Value) bool {
+    return switch (k) {
+        .alias => false,
+        .scalar => |s| s.style == .literal or s.style == .folded or s.text.len > 1000,
+        .seq, .map => !isInline(k),
+    };
+}
+
 /// A plain null written as nothing at all.
 fn isBare(s: Scalar) bool {
     return s.style == .plain and s.text.len == 0 and (s.tag != null or s.kind == .null);
@@ -325,7 +335,11 @@ const Gen = struct {
                 try self.lines(c.before, indent);
                 try self.pad(indent);
             }
-            try self.key(k, indent == 0, false);
+            if (needsExplicitKey(k)) {
+                try self.w.writeByte('?');
+                try self.entryValue(k, null, indent);
+                try self.pad(indent);
+            } else try self.key(k, indent == 0, false);
             try self.w.writeByte(':');
             try self.entryValue(e.value, c.after, indent);
         }
@@ -457,7 +471,8 @@ const Gen = struct {
                 return self.w.writeByte(' ');
             },
             .scalar => |s| s,
-            .seq, .map => unreachable,
+            // Short enough for one line, or `needsExplicitKey` would say so.
+            .seq, .map => return self.flow(v),
         };
         if (hasProps(v)) {
             try self.props(v);

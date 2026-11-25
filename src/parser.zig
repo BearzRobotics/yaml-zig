@@ -406,7 +406,7 @@ const Parser = struct {
         }
         if (inline_root != null) {
             const on_marker_line = "a block collection cannot start on the '---' line";
-            if (isSeqEntry(props.rest)) return self.err(on_marker_line);
+            if (isSeqEntry(props.rest) or isExplicitKey(props.rest)) return self.err(on_marker_line);
             res.root = switch (try self.readNode(props.rest, -1, true)) {
                 .value => |v| v,
                 .key => return self.err(on_marker_line),
@@ -572,6 +572,16 @@ const Parser = struct {
             try self.apply(&v, outer);
             return v;
         }
+        if (isExplicitKey(props.rest)) {
+            if (props.any()) return self.errAt(props.rest, "a '?' entry cannot start on the line of the mapping's properties");
+            if (tabbed) return self.err(tab_message);
+            try self.enterAt(rest);
+            defer self.depth -= 1;
+            self.learnStep(column, under);
+            var v = try self.mapping(column, null);
+            try self.apply(&v, outer);
+            return v;
+        }
         switch (try self.readNode(props.rest, parent, true)) {
             .value => |value| {
                 var v = value;
@@ -587,6 +597,8 @@ const Parser = struct {
                 try self.apply(&key.value, props);
                 try self.enterAt(rest);
                 defer self.depth -= 1;
+                // The key was read before the mapping around it was counted.
+                if (self.depth + levelsIn(key.value) > self.options.max_depth) return self.failHere(rest, "nesting too deep", error.LimitExceeded);
                 self.learnStep(column, under);
                 var v = try self.mapping(column, key);
                 try self.apply(&v, outer);
@@ -729,8 +741,22 @@ const Parser = struct {
 
     /// A key's hash is taken as it goes in, so what it refers to must be whole.
     fn checkKey(self: *Parser, key: Value, column: usize) Error!void {
-        if (key == .alias and !key.alias.complete)
-            return failAt(self.diag, self.pos + 1, column, "a key cannot be an alias of a node that holds it", error.Unsupported);
+        if (holdsOpenAlias(key))
+            return failAt(self.diag, self.pos + 1, column, "a key cannot hold an alias of a node that holds the key", error.Unsupported);
+    }
+
+    fn holdsOpenAlias(v: Value) bool {
+        switch (v) {
+            .alias => |a| return !a.complete,
+            .scalar => return false,
+            .seq => |q| for (q.items.items) |item| {
+                if (holdsOpenAlias(item)) return true;
+            },
+            .map => |m| for (m.entries.keys(), m.entries.values()) |k, e| {
+                if (holdsOpenAlias(k) or holdsOpenAlias(e.value)) return true;
+            },
+        }
+        return false;
     }
 
     /// A node with no content, which may still have properties.
@@ -814,12 +840,11 @@ const Parser = struct {
                 return .{ .value = try self.quotedValue(g) };
             },
             '|', '>' => return .{ .value = try self.blockScalar(rest, parent) },
-            '[', '{' => return .{ .value = try self.flowValue(rest, parent) },
+            '[', '{' => return self.flowNode(rest, parent, keys),
             ',', ']', '}', '#' => return self.errAt(rest, "this indicator cannot start a plain scalar"),
-            '-', '?' => if (rest.len == 1 or isWhite(rest[1])) {
-                if (keys and rest[0] == '?') return self.failHere(rest, "complex keys are not supported", error.Unsupported);
-                return self.errAt(rest, "this indicator cannot start a plain scalar here");
-            },
+            // A `?` entry is dealt with before this, where one may start.
+            '-', '?' => if (rest.len == 1 or isWhite(rest[1]))
+                return self.errAt(rest, "this indicator cannot start a plain scalar here"),
             ':' => if (!keys and (rest.len == 1 or isWhite(rest[1])))
                 return self.errAt(rest, "this indicator cannot start a plain scalar here"),
             else => {},
@@ -855,41 +880,49 @@ const Parser = struct {
                 if (c.indent > indent) return self.err("bad indentation of a sequence entry");
                 if (!isSeqEntry(c.content)) break;
             }
-            var before = try self.takeBefore();
-            const raw = self.lines[self.pos];
-            var j = indent + 1;
-            while (j < raw.len and isWhite(raw[j])) j += 1;
-            const rest = raw[j..];
-            const props = try self.takeProps(rest);
-            var item: Value = undefined;
-            var after: ?[]const u8 = null;
-            if (endsLine(props.rest)) {
-                after = try self.commentOn(props.rest);
-                self.pos += 1;
-                try self.skipBlank();
-                const next = try self.cur();
-                const present = next != null and next.?.indent > indent;
-                item = try self.block(@intCast(indent), indent, props, false);
-                // After a null item, pending comments belong to what follows.
-                if (present) {
-                    const found = try self.commentsAround(item, before, after);
-                    before = found.before;
-                    after = found.after;
-                }
-            } else {
-                // The blanks before a collection on the dash's line indent it,
-                // so they must be spaces.
-                const tabbed = std.mem.indexOfScalar(u8, raw[indent..j], '\t') != null;
-                item = try self.collectionOrNode(rest, props, .{}, @intCast(indent), j, tabbed, null, "a tab cannot indent a collection");
-                after = self.takeTrailing();
-            }
-            try seq.items.append(self.a, item);
-            try seq.comments.append(self.a, .{ .before = before, .after = after });
+            const before = try self.takeBefore();
+            const entry = try self.indented(indent, before, false);
+            try seq.items.append(self.a, entry.value);
+            try seq.comments.append(self.a, entry.comments);
         }
         return .{ .seq = seq };
     }
 
+    const Indented = struct { value: Value, comments: Comments };
+
+    /// What follows the `-`, `?` or `:` in column `indent` of the current line
+    /// (YAML 1.2.2 `s-l+block-indented`): a node on the same line, which may
+    /// be a collection that starts there, or one on the lines below. For `?`
+    /// and `:` those may hold a sequence in the indicator's own column.
+    fn indented(self: *Parser, indent: usize, before: []const []const u8, sequence_at_parent: bool) Error!Indented {
+        const raw = self.lines[self.pos];
+        var j = indent + 1;
+        while (j < raw.len and isWhite(raw[j])) j += 1;
+        const rest = raw[j..];
+        const props = try self.takeProps(rest);
+        if (endsLine(props.rest)) {
+            const line_comment = try self.commentOn(props.rest);
+            self.pos += 1;
+            try self.skipBlank();
+            const present = try self.nodeFollows(@intCast(indent), sequence_at_parent);
+            const value = try self.block(@intCast(indent), indent, props, sequence_at_parent);
+            // After a null value, pending comments belong to what follows.
+            if (!present) return .{ .value = value, .comments = .{ .before = before, .after = line_comment } };
+            return .{ .value = value, .comments = try self.commentsAround(value, before, line_comment) };
+        }
+        // The blanks before a collection on this line indent it, so they must
+        // be spaces.
+        const tabbed = std.mem.indexOfScalar(u8, raw[indent..j], '\t') != null;
+        const value = try self.collectionOrNode(rest, props, .{}, @intCast(indent), j, tabbed, null, "a tab cannot indent a collection");
+        return .{ .value = value, .comments = .{ .before = before, .after = self.takeTrailing() } };
+    }
+
     // ---- mappings --------------------------------------------------------------------
+
+    /// `?` followed by a blank: a key that may be any node.
+    fn isExplicitKey(content: []const u8) bool {
+        return content.len != 0 and content[0] == '?' and (content.len == 1 or isWhite(content[1]));
+    }
 
     /// The key that starts the line at column `indent`.
     fn nextKey(self: *Parser, indent: usize) Error!Key {
@@ -911,39 +944,38 @@ const Parser = struct {
         return self.err("expected 'key:'");
     }
 
-    /// The mapping whose keys are in column `indent`. The first one has been read.
-    fn mapping(self: *Parser, indent: usize, first_key: Key) Error!Value {
+    /// The value after a key and its `:`.
+    fn implicitValue(self: *Parser, indent: usize, key: Key, before: []const []const u8) Error!Indented {
+        const rest = std.mem.trimStart(u8, key.rest, " \t");
+        const props = try self.takeProps(rest);
+        if (endsLine(props.rest)) {
+            const line_comment = try self.commentOn(props.rest);
+            self.pos += 1;
+            try self.skipBlank();
+            const present = try self.nodeFollows(@intCast(indent), true);
+            const value = try self.block(@intCast(indent), indent, props, true);
+            if (!present) return .{ .value = value, .comments = .{ .before = before, .after = line_comment } };
+            return .{ .value = value, .comments = try self.commentsAround(value, before, line_comment) };
+        }
+        var value = (try self.readNode(props.rest, @intCast(indent), false)).value;
+        try self.apply(&value, props);
+        return .{ .value = value, .comments = .{ .before = before, .after = self.takeTrailing() } };
+    }
+
+    /// The mapping whose entries are in column `indent`. `first_key` has been
+    /// read, or is null if the current line starts a `?` entry.
+    fn mapping(self: *Parser, indent: usize, first_key: ?Key) Error!Value {
         const map = try self.a.create(Map);
         map.* = .{};
-        var key = first_key;
+        var implicit = first_key;
         while (true) {
-            try self.checkKey(key.value, key.column);
-            if (map.entries.contains(key.value)) return failAt(self.diag, self.pos + 1, key.column, "duplicate key", error.Syntax);
-            var before = try self.takeBefore();
-            const rest = std.mem.trimStart(u8, key.rest, " \t");
-            const props = try self.takeProps(rest);
-            var v: Value = undefined;
-            var after: ?[]const u8 = null;
-            if (endsLine(props.rest)) {
-                after = try self.commentOn(props.rest);
-                self.pos += 1;
-                try self.skipBlank();
-                const next = try self.cur();
-                const deeper = next != null and next.?.indent > indent;
-                v = try self.block(@intCast(indent), indent, props, true);
-                // After a null value, pending comments belong to what follows.
-                if (v != .scalar or deeper) {
-                    const found = try self.commentsAround(v, before, after);
-                    before = found.before;
-                    after = found.after;
-                }
-            } else {
-                v = (try self.readNode(props.rest, @intCast(indent), false)).value;
-                try self.apply(&v, props);
-                after = self.takeTrailing();
-            }
-            try map.putValue(self.a, key.value, v);
-            map.entries.values()[map.count() - 1].comments = .{ .before = before, .after = after };
+            if (implicit) |key| {
+                try self.checkKey(key.value, key.column);
+                if (map.entries.contains(key.value)) return failAt(self.diag, self.pos + 1, key.column, "duplicate key", error.Syntax);
+                const before = try self.takeBefore();
+                const entry = try self.implicitValue(indent, key, before);
+                try addEntry(self.a, map, key.value, entry.value, entry.comments);
+            } else try self.explicitEntry(map, indent);
 
             try self.skipBlank();
             const c = (try self.cur()) orelse break;
@@ -951,9 +983,43 @@ const Parser = struct {
             if (c.tabbed) return self.err("a tab cannot indent a line");
             if (c.indent > indent) return self.err("bad indentation of a mapping entry");
             if (isSeqEntry(c.content)) break;
-            key = try self.nextKey(indent);
+            implicit = if (isExplicitKey(c.content)) null else try self.nextKey(indent);
         }
         return .{ .map = map };
+    }
+
+    fn addEntry(a: Allocator, map: *Map, key: Value, value: Value, comments: Comments) Error!void {
+        try map.putValue(a, key, value);
+        map.entries.values()[map.count() - 1].comments = comments;
+    }
+
+    /// `? key`, and the `: value` that may follow in the same column.
+    fn explicitEntry(self: *Parser, map: *Map, indent: usize) Error!void {
+        const key_line = self.pos;
+        const key = try self.indented(indent, try self.takeBefore(), true);
+        try self.checkKey(key.value, indent + 1);
+        if (map.entries.contains(key.value)) return failAt(self.diag, key_line + 1, indent + 1, "duplicate key", error.Syntax);
+
+        try self.skipBlank();
+        const next = try self.cur();
+        const has_value = if (next) |c|
+            c.indent == indent and !c.tabbed and c.content[0] == ':' and (c.content.len == 1 or isWhite(c.content[1]))
+        else
+            false;
+        if (!has_value) return addEntry(self.a, map, key.value, null_scalar, key.comments);
+
+        // An entry has one comment line; any other joins the lines above it.
+        var above: std.ArrayList([]const u8) = .empty;
+        try above.appendSlice(self.a, key.comments.before);
+        const between = try self.takeBefore();
+        const value = try self.indented(indent, &.{}, true);
+        if (value.comments.after != null) {
+            if (key.comments.after) |c| try above.append(self.a, c);
+        }
+        for ([_][]const []const u8{ between, value.comments.before }) |group| {
+            for (group) |line| if (line.len != 0) try above.append(self.a, line);
+        }
+        try addEntry(self.a, map, key.value, value.value, .{ .before = above.items, .after = value.comments.after orelse key.comments.after });
     }
 
     // ---- scalars and flow collections ---------------------------------------------------
@@ -1168,23 +1234,28 @@ const Parser = struct {
 
     // ---- flow collections ---------------------------------------------------------------
 
-    /// The flow collection that starts `first`, a suffix of the current line.
-    fn flowValue(self: *Parser, first: []const u8, parent: i64) Error!Value {
+    /// The flow collection that starts `first`, a suffix of the current line,
+    /// as a value or, with `keys`, as the key it turns out to be.
+    fn flowNode(self: *Parser, first: []const u8, parent: i64, keys: bool) Error!Node {
         const line = self.lines[self.pos];
+        const first_line = self.pos;
         var flow: Flow = .{ .p = self, .line = line, .i = line.len - first.len, .parent = parent };
-        const v = try flow.node();
+        const v = try flow.content();
         const tail = flow.line[flow.i..];
         const rest = std.mem.trimStart(u8, tail, " \t");
+        if (keys and isValueIndicator(rest, 0)) {
+            if (self.pos != first_line) return self.failHere(rest, "a key must be on one line", error.Syntax);
+            return .{ .key = .{ .column = self.columnOf(first), .value = v, .rest = rest[1..] } };
+        }
         // Without a comment after the closing bracket, the last one inside is
         // moved there rather than lost.
         self.trailing = flow.last_comment;
         if (rest.len != 0) {
-            if (rest[0] == ':') return self.failHere(rest, "a collection as a key is not supported", error.Unsupported);
             if (rest[0] != '#' or rest.len == tail.len) return self.errAt(rest, "unexpected text after a flow collection");
             self.trailing = try self.keepComment(std.mem.trimEnd(u8, rest, " \t"));
         }
         self.pos += 1;
-        return v;
+        return .{ .value = v };
     }
 
     // ---- quoted text ---------------------------------------------------------------------
@@ -1413,10 +1484,7 @@ const Flow = struct {
             ',', ']', '}' => return self.err("a flow collection entry cannot be empty"),
             '|', '>', '%', '@', '`', '#' => return self.err("this character cannot start a value in a flow collection"),
             '?', ':', '-' => {
-                if (self.separatorFollows()) {
-                    if (c == '?') return self.p.unsupported("complex keys are not supported");
-                    return self.err("this indicator cannot start a value in a flow collection");
-                }
+                if (self.separatorFollows()) return self.err("this indicator cannot start a value in a flow collection");
                 return self.plain();
             },
             else => return self.plain(),
@@ -1475,8 +1543,18 @@ const Flow = struct {
     /// a single `key: value` pair.
     const Entry = struct { key: Value, value: ?Value };
 
-    fn entry(self: *Flow, in_mapping: bool) Error!Entry {
+    fn entry(self: *Flow, in_mapping: bool, close: u8) Error!Entry {
         const first_line = self.p.pos;
+        // `? ` marks a pair outright, and lets it run over several lines.
+        const explicit = self.peek() == '?' and
+            (self.i + 1 >= self.line.len or self.line[self.i + 1] == ' ' or self.line[self.i + 1] == '\t');
+        if (explicit) {
+            self.i += 1;
+            try self.skip();
+            const c = self.peek().?;
+            if (c == ',' or c == close) return .{ .key = null_scalar, .value = null_scalar };
+        }
+        const none: ?Value = if (explicit) null_scalar else null;
         var key: Value = null_scalar;
         var json_like = false;
         const empty_key = self.peek() == ':' and self.separatorFollows();
@@ -1485,14 +1563,15 @@ const Flow = struct {
             // `"key":value` may leave out the blank after the colon.
             json_like = switch (key) {
                 .scalar => |s| s.style == .single or s.style == .double,
-                else => true,
+                .seq, .map => true,
+                .alias => false,
             };
         }
-        // In a sequence, a pair's key and its `:` share one line.
-        if (in_mapping) try self.skip() else self.skipInLine();
-        // `"key":value` may leave out the blank after the colon.
-        if (self.peek() != ':' or !(json_like or self.separatorFollows())) return .{ .key = key, .value = null };
-        if (!in_mapping and self.p.pos != first_line) return self.err("a key in a flow sequence must be on one line");
+        // In a sequence, an implicit pair's key and its `:` share one line.
+        const one_line = !in_mapping and !explicit;
+        if (one_line) self.skipInLine() else try self.skip();
+        if (self.peek() != ':' or !(json_like or self.separatorFollows())) return .{ .key = key, .value = none };
+        if (one_line and self.p.pos != first_line) return self.err("a key in a flow sequence must be on one line");
         self.i += 1;
         try self.skip();
         const c = self.peek().?;
@@ -1501,10 +1580,6 @@ const Flow = struct {
     }
 
     fn put(self: *Flow, m: *Map, key: Value, value: Value) Error!void {
-        switch (key) {
-            .scalar, .alias => {},
-            .seq, .map => return self.p.unsupported("a collection as a key is not supported"),
-        }
         try self.p.checkKey(key, self.i + 1);
         if (m.entries.contains(key)) return self.err("duplicate key");
         try m.putValue(self.p.a, key, value);
@@ -1530,11 +1605,11 @@ const Flow = struct {
                 self.i += 1;
                 return .{ .seq = s };
             }
-            const e = try self.entry(false);
+            const e = try self.entry(false, ']');
             if (e.value) |v| {
-                // The pair is a mapping around its value: one level more than
-                // was counted while the value was read.
-                if (self.p.depth + 1 + levelsIn(v) > self.p.options.max_depth) return self.p.fail("nesting too deep", error.LimitExceeded);
+                // The pair is a mapping around its key and value: one level
+                // more than was counted while they were read.
+                if (self.p.depth + 1 + @max(levelsIn(e.key), levelsIn(v)) > self.p.options.max_depth) return self.p.fail("nesting too deep", error.LimitExceeded);
                 const pair = try self.p.a.create(Map);
                 pair.* = .{ .flow = true };
                 try self.put(pair, e.key, v);
@@ -1556,7 +1631,7 @@ const Flow = struct {
                 self.i += 1;
                 return .{ .map = m };
             }
-            const e = try self.entry(true);
+            const e = try self.entry(true, '}');
             try self.put(m, e.key, e.value orelse null_scalar);
             try self.separator('}', "expected ',' or '}' in a flow mapping");
         }
@@ -1571,8 +1646,8 @@ fn levelsIn(v: Value) usize {
         .seq => |q| for (q.items.items) |item| {
             deepest = @max(deepest, levelsIn(item));
         },
-        .map => |m| for (m.entries.values()) |e| {
-            deepest = @max(deepest, levelsIn(e.value));
+        .map => |m| for (m.entries.keys(), m.entries.values()) |k, e| {
+            deepest = @max(deepest, levelsIn(k), levelsIn(e.value));
         },
     }
     return 1 + deepest;
