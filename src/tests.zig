@@ -422,3 +422,21 @@ test "a quote inside a plain scalar does not hide a comment" {
     try testing.expectEqualStrings("x", doc.root.seq.items.items[1].map.getString("it's").?);
     try rejects("a: \"value\"# c\n", error.Syntax);
 }
+
+test "text that is not a valid plain scalar is rejected" {
+    for ([_][]const u8{ "a: b: c\n", "a: b: c: d\n", "a: x:\n", "a: - x\n", "a: -\n", "a: ? x\n", "a: : x\n", "a: ,x\n", "a: ]x\n", "a: }x\n", "- b: c: d\n", "a: x\n  y: z\n" }) |src| {
+        try rejects(src, error.Syntax);
+    }
+    var doc = try parse("a: -x\nb: ?y\nc: :z\nd: http://h:1/#f\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("-x", doc.root.map.getString("a").?);
+    try testing.expectEqualStrings("http://h:1/#f", doc.root.map.getString("d").?);
+}
+
+test "indicators on a continuation line are plain text" {
+    try expectString("a: x\n  - y\n", "x - y");
+    try expectString("a: say\n  \"hi\" [now] | > {x}\n", "say \"hi\" [now] | > {x}");
+    var doc = try parse("- single multiline\n - sequence entry\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("single multiline - sequence entry", doc.root.seq.items.items[0].scalar.text);
+}

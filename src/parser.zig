@@ -383,6 +383,11 @@ const Parser = struct {
             '"', '\'' => return self.quotedScalar(rest, parent),
             '|', '>' => return self.blockScalar(rest, parent),
             '[', '{' => return self.flowValue(rest, parent),
+            ',', ']', '}', '#' => return self.err("this indicator cannot start a plain scalar"),
+            '-', '?', ':' => {
+                if (rest.len == 1 or isWhite(rest[1])) return self.err("this indicator cannot start a plain scalar here");
+                return self.plainScalar(rest, parent);
+            },
             else => return self.plainScalar(rest, parent),
         }
     }
@@ -442,10 +447,13 @@ const Parser = struct {
     fn plainScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
         const sc = splitPlain(first);
         var out: std.ArrayList(u8) = .empty;
-        try out.appendSlice(self.a, std.mem.trimEnd(u8, sc.content, " \t"));
+        const head = std.mem.trimEnd(u8, sc.content, " \t");
+        if (hasMappingIndicator(head)) return self.err("':' followed by a blank cannot appear in a plain scalar");
+        try out.appendSlice(self.a, head);
         var comment = sc.comment;
         self.pos += 1;
         // Continuation lines: more indented than the parent, until a comment.
+        // Indicators such as `- ` or a quote are plain text on these lines.
         while (comment == null) {
             var j = self.pos;
             var blanks: usize = 0;
@@ -456,8 +464,9 @@ const Parser = struct {
             if (@as(i64, @intCast(ind)) <= parent or l[ind] == '#' or isForbidden(l)) break;
             const part = splitPlain(l[ind..]);
             const t = std.mem.trim(u8, part.content, " \t");
-            if (std.mem.indexOf(u8, t, ": ") != null or std.mem.endsWith(u8, t, ":") or isSeqEntry(t) or (t.len > 0 and (t[0] == '"' or t[0] == '\'' or t[0] == '[' or t[0] == '{' or t[0] == '|' or t[0] == '>')))
-                return self.err("unexpected content after a plain scalar (bad indentation?)");
+            // Only a comment line leaves nothing here.
+            if (t.len == 0) break;
+            if (hasMappingIndicator(t)) return self.err("unexpected content after a plain scalar (bad indentation?)");
             if (blanks == 0) try out.append(self.a, ' ') else try out.appendNTimes(self.a, '\n', blanks);
             try out.appendSlice(self.a, t);
             comment = part.comment;
@@ -466,6 +475,13 @@ const Parser = struct {
         self.trailing = if (comment) |t| try self.a.dupe(u8, t) else null;
         const text = out.items;
         return .{ .scalar = .{ .text = text, .style = .plain, .kind = model.resolve(text) } };
+    }
+
+    fn hasMappingIndicator(s: []const u8) bool {
+        for (s, 0..) |c, i| {
+            if (c == ':' and (i + 1 == s.len or isWhite(s[i + 1]))) return true;
+        }
+        return false;
     }
 
     fn blockScalar(self: *Parser, header: []const u8, parent: i64) Error!Value {
