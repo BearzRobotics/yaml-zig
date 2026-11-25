@@ -385,3 +385,26 @@ test "content on the '---' line" {
     try rejects("--- a: 1\n", error.Syntax);
     try rejects("--- - a\n", error.Syntax);
 }
+
+test "anchors, tags and aliases on keys are refused, not read as text" {
+    try rejects("&a key: v\n", error.Unsupported);
+    try rejects("!!str a: 1\n", error.Unsupported);
+    try rejects("*a : 1\n", error.Unsupported);
+    try rejects("- &a x: 1\n", error.Unsupported);
+    try rejects("a: 1\n&b c: 2\n", error.Unsupported);
+    try rejects("?\ta\n", error.Unsupported);
+    try rejects("@a: 1\n", error.Syntax);
+    try rejects("`a: 1\n", error.Syntax);
+    try rejects("%a: 1\nb: 2\n", error.Unsupported); // a directive line
+    try rejects("b: 2\n%a: 1\n", error.Syntax);
+}
+
+test "empty keys, and tabs around the colon" {
+    var doc = try parse(": a\nb:\tc\n\"d\":\te\n\"f\"\t: g\n");
+    defer doc.deinit();
+    const m = doc.root.map;
+    try testing.expectEqualStrings("a", m.getString("").?);
+    try testing.expectEqualStrings("c", m.getString("b").?);
+    try testing.expectEqualStrings("e", m.getString("d").?);
+    try testing.expectEqualStrings("g", m.getString("f").?);
+}

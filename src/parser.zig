@@ -119,6 +119,10 @@ const Parser = struct {
 
     // ---- lines ---------------------------------------------------------------
 
+    fn isWhite(c: u8) bool {
+        return c == ' ' or c == '\t';
+    }
+
     fn isBlank(l: []const u8) bool {
         return std.mem.trim(u8, l, " \t").len == 0;
     }
@@ -295,22 +299,30 @@ const Parser = struct {
     fn splitKey(self: *Parser, content: []const u8) Error!?KeyInfo {
         if (content.len == 0) return null;
         const c0 = content[0];
-        if (c0 == '[' or c0 == '{' or c0 == '|' or c0 == '>') return null;
-        if (c0 == '?' and (content.len == 1 or content[1] == ' ')) return self.unsupported("complex keys are not supported");
+        switch (c0) {
+            // Not simple keys: `scalarAt` deals with them.
+            '[', '{', '|', '>' => return null,
+            // A line that starts like this is refused whether or not it has a key.
+            '&', '*', '!' => return self.unsupported("anchors, aliases and tags are not supported"),
+            '@', '`' => return self.err("a reserved indicator cannot start a scalar"),
+            '%' => return self.err("a '%' cannot start a plain scalar"),
+            '?' => if (content.len == 1 or isWhite(content[1])) return self.unsupported("complex keys are not supported"),
+            else => {},
+        }
         if (c0 == '"' or c0 == '\'') {
             const end = scanQuoted(content) orelse return null;
             var k = end;
-            while (k < content.len and content[k] == ' ') k += 1;
-            if (k < content.len and content[k] == ':' and (k + 1 == content.len or content[k + 1] == ' ')) {
+            while (k < content.len and isWhite(content[k])) k += 1;
+            if (k < content.len and content[k] == ':' and (k + 1 == content.len or isWhite(content[k + 1]))) {
                 return .{ .key = try self.decodeQuoted(content[0..end]), .rest = k + 1 };
             }
             return null;
         }
         var i: usize = 0;
         while (i < content.len) : (i += 1) {
-            if (content[i] == ':' and (i + 1 == content.len or content[i + 1] == ' ' or content[i + 1] == '\t')) {
+            if (content[i] == ':' and (i + 1 == content.len or isWhite(content[i + 1]))) {
+                // The key may be empty (`: value`).
                 const key = std.mem.trimEnd(u8, content[0..i], " \t");
-                if (key.len == 0) return self.err("empty key");
                 return .{ .key = try self.a.dupe(u8, key), .rest = i + 1 };
             }
         }
