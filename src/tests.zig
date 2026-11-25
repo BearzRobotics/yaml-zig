@@ -598,3 +598,18 @@ test "empty block scalars from a file" {
         if (doc.root == .scalar) try testing.expectEqualStrings(doc.root.scalar.text, back.root.scalar.text);
     }
 }
+
+test "a '|+' value does not absorb the blank lines after it" {
+    var doc = try parse("a: x\n\nb: 1\n\n# end\n");
+    defer doc.deinit();
+    for ([_][]const u8{ "t\n\n", "\n", "t\n\n\n" }) |text| {
+        // Before another item, and before the footer.
+        try doc.set(&.{"a"}, try doc.string(text));
+        try doc.set(&.{"b"}, try doc.string(text));
+        var back = try writeAndRead(&doc);
+        defer back.deinit();
+        try testing.expectEqualStrings(text, back.root.map.getString("a").?);
+        try testing.expectEqualStrings(text, back.root.map.getString("b").?);
+        try testing.expectEqualStrings("# end", back.footer[back.footer.len - 1]);
+    }
+}

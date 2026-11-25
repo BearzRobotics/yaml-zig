@@ -80,13 +80,19 @@ fn checkUtf8(v: Value) error{InvalidUtf8}!void {
 const Gen = struct {
     w: *Writer,
     step: usize,
+    /// Set after a block scalar with keep chomping: empty lines written now
+    /// would become part of its value.
+    after_keep: bool = false,
 
+    /// Starts a line that is not empty.
     fn pad(self: *Gen, n: usize) Error!void {
+        self.after_keep = false;
         try self.w.splatByteAll(' ', n);
     }
 
     fn lines(self: *Gen, ls: []const []const u8, indent: usize) Error!void {
         for (ls) |l| {
+            if (l.len == 0 and self.after_keep) continue;
             if (l.len != 0) try self.pad(indent);
             try self.w.writeAll(l);
             try self.w.writeByte('\n');
@@ -255,6 +261,7 @@ const Gen = struct {
         }
         // With keep chomping each further newline is an empty line.
         if (keep) try self.w.splatByteAll('\n', if (body.len != 0) nl - 1 else nl);
+        self.after_keep = keep;
     }
 
     fn key(self: *Gen, k: []const u8) Error!void {
