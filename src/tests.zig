@@ -422,6 +422,9 @@ test "quotes and line breaks inside flow collections" {
 test "flow pairs, comments and a trailing comma" {
     try expectWritten("a: [k: v, \"q\":w, : x]\n", "a: [{k: v}, {\"q\": w}, {: x}]\n");
     try expectWritten("a: [1, # inner\n  2, ] # outer\n", "a: [1, 2] # outer\n");
+    // With nothing after the bracket, the last comment inside moves there.
+    try expectStable("a: [1, # first\n  # last\n  2]\n", "a: [1, 2] # last\n");
+    try rejects("a: [1, # \x7f\n  2]\n", error.Syntax);
     try expectWritten("a: {x:\n  1,\n  y\n  : 2}\n", "a: {x: 1, y: 2}\n");
 }
 
@@ -993,7 +996,7 @@ test "a large multi-line flow collection" {
 
 // A deliberate departure from the spec (see ai/SPEC.md).
 test "a closing bracket may stand in the parent's column" {
-    try expectWritten("a:\n  os: [\n    x, # c\n  ]\n  b: 1\n", "a:\n  os: [x]\n  b: 1\n");
+    try expectWritten("a:\n  os: [\n    x, # c\n  ]\n  b: 1\n", "a:\n  os: [x] # c\n  b: 1\n");
     try expectWritten("a:\n  r: ['e', {\n    b: 1\n  }]\n", "a:\n  r: ['e', {b: 1}]\n");
     try expectWritten("- [\n  x\n]\n", "- [x]\n");
     // Only the bracket, and only in that column.

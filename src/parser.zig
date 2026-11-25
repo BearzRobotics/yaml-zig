@@ -736,7 +736,9 @@ const Parser = struct {
         const v = try flow.node();
         const tail = flow.line[flow.i..];
         const rest = std.mem.trimStart(u8, tail, " \t");
-        self.trailing = null;
+        // Without a comment after the closing bracket, the last one inside is
+        // moved there rather than lost.
+        self.trailing = flow.last_comment;
         if (rest.len != 0) {
             if (rest[0] == ':') return self.unsupported("a collection as a key is not supported");
             if (rest[0] != '#' or rest.len == tail.len) return self.err("unexpected text after a flow collection");
@@ -851,14 +853,15 @@ const Parser = struct {
 };
 
 /// Reads a flow collection straight from the source lines: `line` is line
-/// `p.pos` and `i` the next byte in it. Comments inside the collection are
-/// dropped.
+/// `p.pos` and `i` the next byte in it. Comments inside the collection have no
+/// item to belong to; only the last one is remembered.
 const Flow = struct {
     p: *Parser,
     line: []const u8,
     i: usize,
     /// Indent of the enclosing block node; further lines must go past it.
     parent: i64,
+    last_comment: ?[]const u8 = null,
 
     /// A syntax error at the cursor.
     fn err(self: *Flow, msg: []const u8) Error {
@@ -883,6 +886,7 @@ const Flow = struct {
                 const comment = self.line[self.i] == '#' and
                     (self.i == 0 or self.line[self.i - 1] == ' ' or self.line[self.i - 1] == '\t');
                 if (!comment) return;
+                self.last_comment = try self.p.keepComment(std.mem.trimEnd(u8, self.line[self.i..], " \t"));
             }
             self.p.pos += 1;
             if (self.p.pos >= self.p.lines.len) return self.err("unterminated flow collection");
