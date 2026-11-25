@@ -7,8 +7,10 @@
 //! yaml-zig reads a documented subset of YAML, so each case lands in one of
 //! these groups:
 //!
-//!   pass         read to the expected value (and the same value again after
-//!                being written), or an invalid input that is rejected
+//!   pass         read with the structure in the case's `test.event` (every
+//!                node's kind, style and text) and the value in its
+//!                `in.json`, and read the same again after being written; or
+//!                an invalid input that is rejected
 //!   unsupported  valid input refused with `error.Unsupported`
 //!   FAIL         anything else: valid input rejected as malformed, a wrong
 //!                value, output that does not read back, or invalid input
@@ -30,7 +32,7 @@ const rejected_on_purpose = [_]struct { case: []const u8, why: []const u8 }{
     .{ .case = "2JQS", .why = "two empty keys in one mapping" },
 };
 
-const Outcome = enum { pass, unsupported, on_purpose, rejected_valid, wrong_value, bad_round_trip, accepted_invalid };
+const Outcome = enum { pass, unsupported, on_purpose, rejected_valid, wrong_structure, wrong_value, bad_round_trip, accepted_invalid };
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -105,6 +107,9 @@ fn runCase(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, case: std.I
     defer doc.deinit();
     if (must_fail) return .accepted_invalid;
 
+    const expected = try case.readFileAlloc(io, "test.event", a, .limited(max_file));
+    if (!try sameStructure(a, &doc, expected)) return .wrong_structure;
+
     const json_text: ?[]const u8 = case.readFileAlloc(io, "in.json", a, .limited(max_file)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => return e,
@@ -123,6 +128,75 @@ fn runCase(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, case: std.I
     defer again.deinit();
     if (!same(doc.root, again.root)) return .bad_round_trip;
     return .pass;
+}
+
+/// Compares `doc` with the suite's event stream. Whether a document's start
+/// and end markers were written is left out: it is not part of the tree.
+fn sameStructure(a: std.mem.Allocator, doc: *const yaml.Document, expected: []const u8) !bool {
+    var want: std.Io.Writer.Allocating = .init(a);
+    var documents: usize = 0;
+    var lines = std.mem.tokenizeAny(u8, expected, "\r\n");
+    while (lines.next()) |raw| {
+        // Leading blanks only show nesting; trailing ones are scalar text.
+        var line = std.mem.trimStart(u8, raw, " ");
+        if (std.mem.startsWith(u8, line, "+DOC")) {
+            documents += 1;
+            line = "+DOC";
+        } else if (std.mem.startsWith(u8, line, "-DOC")) line = "-DOC";
+        try want.writer.print("{s}\n", .{line});
+    }
+    if (documents > 1) return false;
+
+    var got: std.Io.Writer.Allocating = .init(a);
+    const w = &got.writer;
+    try w.writeAll("+STR\n");
+    // A stream without a document reads as an empty one.
+    if (documents != 0) {
+        try w.writeAll("+DOC\n");
+        try events(w, doc.root);
+        try w.writeAll("-DOC\n");
+    } else if (doc.root != .scalar or doc.root.scalar.text.len != 0) return false;
+    try w.writeAll("-STR\n");
+    return std.mem.eql(u8, got.written(), want.written());
+}
+
+fn events(w: *std.Io.Writer, v: yaml.Value) !void {
+    switch (v) {
+        .scalar => |s| try scalarEvent(w, s.style, s.text),
+        .seq => |q| {
+            try w.print("+SEQ{s}\n", .{if (q.flow) " []" else ""});
+            for (q.items.items) |item| try events(w, item);
+            try w.writeAll("-SEQ\n");
+        },
+        .map => |m| {
+            try w.print("+MAP{s}\n", .{if (m.flow) " {}" else ""});
+            for (m.entries.keys(), m.entries.values()) |k, item| {
+                try scalarEvent(w, m.key_styles.get(k) orelse .plain, k);
+                try events(w, item);
+            }
+            try w.writeAll("-MAP\n");
+        },
+    }
+}
+
+fn scalarEvent(w: *std.Io.Writer, style: yaml.Style, text: []const u8) !void {
+    const indicator: u8 = switch (style) {
+        .plain => ':',
+        .single => '\'',
+        .double => '"',
+        .literal => '|',
+        .folded => '>',
+    };
+    try w.print("=VAL {c}", .{indicator});
+    for (text) |c| switch (c) {
+        '\\' => try w.writeAll("\\\\"),
+        '\n' => try w.writeAll("\\n"),
+        '\t' => try w.writeAll("\\t"),
+        '\r' => try w.writeAll("\\r"),
+        8 => try w.writeAll("\\b"),
+        else => try w.writeByte(c),
+    };
+    try w.writeByte('\n');
 }
 
 fn matches(v: yaml.Value, want: Json) bool {
