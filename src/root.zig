@@ -43,6 +43,8 @@ pub const Document = struct {
     /// Comments on a root that is a scalar or a flow collection: the lines
     /// above it and the comment on its line.
     root_comments: Comments = .{},
+    /// The comment on the `---` line, written only with `explicit_start`.
+    start_comment: ?[]const u8 = null,
 
     /// An empty document whose root is an empty mapping.
     pub fn init(gpa: Allocator) Allocator.Error!Document {
@@ -67,6 +69,7 @@ pub const Document = struct {
             .header = res.header,
             .footer = res.footer,
             .root_comments = res.root_comments,
+            .start_comment = res.start_comment,
         };
     }
 
@@ -227,6 +230,7 @@ pub const Document = struct {
             .header = self.header,
             .footer = self.footer,
             .root_comments = self.root_comments,
+            .start_comment = self.start_comment,
         });
     }
 

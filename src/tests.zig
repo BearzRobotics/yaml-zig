@@ -689,3 +689,7 @@ test "the comment on the dash of a mapping entry is written" {
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("# above\n- # important\n  a: 1\n- b: 2\n", out);
 }
+
+test "comments on the document marker lines survive" {
+    try expectStable("--- # c1\na: 1\n... # c2\n# c3\n", "--- # c1\na: 1\n# c2\n# c3\n");
+}

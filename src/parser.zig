@@ -64,6 +64,8 @@ pub const Result = struct {
     /// Comments on a root that is a scalar or a flow collection. (Those of a
     /// block collection belong to its items.)
     root_comments: Comments = .{},
+    /// The comment on the `---` line.
+    start_comment: ?[]const u8 = null,
 };
 
 const null_scalar: Value = .{ .scalar = .{ .text = "", .style = .plain, .kind = .null } };
@@ -240,7 +242,10 @@ const Parser = struct {
                 if (self.pending.items.len != 0) res.header = try self.a.dupe([]const u8, self.pending.items);
                 self.pending.clearRetainingCapacity();
                 const rest = std.mem.trimStart(u8, self.lines[self.pos][3..], " \t");
-                if (rest.len == 0 or rest[0] == '#') self.pos += 1 else inline_root = rest;
+                if (rest.len == 0 or rest[0] == '#') {
+                    if (rest.len != 0) res.start_comment = try self.keepComment(std.mem.trimEnd(u8, rest, " \t"));
+                    self.pos += 1;
+                } else inline_root = rest;
             } else if (c.indent == 0 and c.content[0] == '%') return self.unsupported("directives are not supported");
         }
         if (inline_root) |rest| {
@@ -266,6 +271,8 @@ const Parser = struct {
             while (try self.cur()) |end| {
                 if (!isDocMarker(end) or end.content[0] != '.') return self.unsupported("several documents are not supported");
                 if (end.content.len != 3) return self.err("unexpected content after '...'");
+                // `...` is not written back; its comment becomes a footer line.
+                if (splitPlain(self.lines[self.pos][3..]).comment) |t| try self.pending.append(self.gpa, try self.keepComment(t));
                 self.pos += 1;
                 try self.skipBlank();
             }

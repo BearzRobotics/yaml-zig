@@ -29,6 +29,7 @@ pub const Doc = struct {
     header: []const []const u8,
     footer: []const []const u8,
     root_comments: Comments = .{},
+    start_comment: ?[]const u8 = null,
 };
 
 pub fn write(w: *Writer, doc: Doc) Error!void {
@@ -38,9 +39,13 @@ pub fn write(w: *Writer, doc: Doc) Error!void {
     try checkComment(.{ .before = doc.header });
     try checkComment(.{ .before = doc.footer });
     try checkComment(doc.root_comments);
+    try checkComment(.{ .after = doc.start_comment });
     var g: Gen = .{ .w = w, .step = @max(doc.indent, 1) };
     try g.lines(doc.header, 0);
-    if (doc.explicit_start) try w.writeAll("---\n");
+    if (doc.explicit_start) {
+        try w.writeAll("---");
+        try g.tail(doc.start_comment);
+    }
     try g.lines(doc.root_comments.before, 0);
     const after = doc.root_comments.after;
     if (isInline(doc.root)) try g.rootInline(doc.root, after) else {
