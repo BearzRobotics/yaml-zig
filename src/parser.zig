@@ -215,10 +215,12 @@ const Parser = struct {
         const c = (try self.cur()) orelse return null_scalar;
         if (@as(i64, @intCast(c.indent)) <= parent) return null_scalar;
         if (isDocMarker(c)) return null_scalar;
-        try self.enter();
-        defer self.depth -= 1;
-        if (isSeqEntry(c.content)) return self.sequence(c.indent);
-        if (try self.splitKey(c.content)) |_| return self.mapping(c.indent);
+        const is_seq = isSeqEntry(c.content);
+        if (is_seq or try self.splitKey(c.content) != null) {
+            try self.enter();
+            defer self.depth -= 1;
+            return if (is_seq) self.sequence(c.indent) else self.mapping(c.indent);
+        }
         return self.scalarAt(self.lines[self.pos][c.indent..], parent);
     }
 
@@ -361,34 +363,51 @@ const Parser = struct {
             '%' => return self.err("a '%' cannot start a plain scalar"),
             '"', '\'' => return self.quotedScalar(rest, parent),
             '|', '>' => return self.blockScalar(rest, parent),
-            '[', '{' => return self.flowValue(rest),
+            '[', '{' => return self.flowValue(rest, parent),
             else => return self.plainScalar(rest, parent),
         }
     }
 
-    fn quotedScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
-        // A quoted scalar may run over several lines. They are gathered in one
-        // growable buffer, and the search for the closing quote resumes where
-        // it stopped, so the cost stays linear in the size of the scalar.
+    const Gathered = struct {
+        /// The quoted scalar, quotes included, line breaks as `\n`.
+        quoted: []const u8,
+        /// What follows the closing quote on its line.
+        tail: []const u8,
+    };
+
+    /// Reads the quoted scalar that starts `first`, a suffix of the current
+    /// line, leaving `pos` on the line that closes it. The lines are gathered
+    /// in one growable buffer and the search for the closing quote resumes
+    /// where it stopped, so the cost stays linear in the size of the scalar.
+    fn gatherQuoted(self: *Parser, first: []const u8, parent: i64) Error!Gathered {
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(self.gpa);
         try buf.appendSlice(self.gpa, first);
         var scan: QuoteScan = .{ .quote = first[0] };
+        var line = first;
         const end = while (true) {
             if (scan.find(buf.items)) |e| break e;
             self.pos += 1;
             if (self.pos >= self.lines.len) return self.err("unterminated quoted scalar");
-            try self.checkContinuation(self.lines[self.pos], parent);
+            line = self.lines[self.pos];
+            try self.checkContinuation(line, parent);
             try buf.append(self.gpa, '\n');
-            try buf.appendSlice(self.gpa, self.lines[self.pos]);
+            try buf.appendSlice(self.gpa, line);
         };
-        const text = try self.a.dupe(u8, buf.items);
-        const tail = splitComment(text[end..]);
+        return .{
+            .quoted = try self.a.dupe(u8, buf.items[0..end]),
+            .tail = line[line.len - (buf.items.len - end) ..],
+        };
+    }
+
+    fn quotedScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
+        const g = try self.gatherQuoted(first, parent);
+        const tail = splitComment(g.tail);
         if (std.mem.trim(u8, tail.content, " \t").len != 0) return self.err("unexpected text after a quoted scalar");
         self.trailing = if (tail.comment) |t| try self.a.dupe(u8, t) else null;
+        const s = try self.decodeQuoted(g.quoted);
         self.pos += 1;
-        const s = try self.decodeQuoted(text[0..end]);
-        return .{ .scalar = .{ .text = s, .style = if (text[0] == '"') .double else .single, .kind = .string } };
+        return .{ .scalar = .{ .text = s, .style = if (g.quoted[0] == '"') .double else .single, .kind = .string } };
     }
 
     /// A further line of a flow scalar or flow collection must be indented
@@ -512,43 +531,21 @@ const Parser = struct {
 
     // ---- flow collections ---------------------------------------------------------------
 
-    fn flowValue(self: *Parser, first: []const u8) Error!Value {
-        // Gather lines until the brackets balance; comments inside are dropped.
-        var text: std.ArrayList(u8) = .empty;
-        var sc = splitComment(first);
-        try text.appendSlice(self.a, std.mem.trimEnd(u8, sc.content, " \t"));
-        var comment = sc.comment;
-        while (!balanced(text.items)) {
-            self.pos += 1;
-            if (self.pos >= self.lines.len) return self.err("unterminated flow collection");
-            sc = splitComment(self.lines[self.pos]);
-            try text.append(self.a, ' ');
-            try text.appendSlice(self.a, std.mem.trim(u8, sc.content, " \t"));
-            if (sc.comment != null) comment = sc.comment;
+    /// The flow collection that starts `first`, a suffix of the current line.
+    fn flowValue(self: *Parser, first: []const u8, parent: i64) Error!Value {
+        const line = self.lines[self.pos];
+        var flow: Flow = .{ .p = self, .line = line, .i = line.len - first.len, .parent = parent };
+        const v = try flow.node();
+        const tail = flow.line[flow.i..];
+        const rest = std.mem.trimStart(u8, tail, " \t");
+        self.trailing = null;
+        if (rest.len != 0) {
+            if (rest[0] == ':') return self.unsupported("a collection as a key is not supported");
+            if (rest[0] != '#' or rest.len == tail.len) return self.err("unexpected text after a flow collection");
+            self.trailing = try self.a.dupe(u8, std.mem.trimEnd(u8, rest, " \t"));
         }
         self.pos += 1;
-        self.trailing = if (comment) |t| try self.a.dupe(u8, t) else null;
-        var fp: Flow = .{ .p = self, .s = text.items };
-        const v = try fp.value();
-        fp.skipWs();
-        if (fp.i != fp.s.len) return self.err("unexpected text after a flow collection");
         return v;
-    }
-
-    fn balanced(s: []const u8) bool {
-        var depth: i32 = 0;
-        var i: usize = 0;
-        while (i < s.len) : (i += 1) {
-            switch (s[i]) {
-                '[', '{' => depth += 1,
-                ']', '}' => depth -= 1,
-                '"', '\'' => {
-                    if (scanQuoted(s[i..])) |e| i += e - 1 else return false;
-                },
-                else => {},
-            }
-        }
-        return depth <= 0;
     }
 
     // ---- quoted text ---------------------------------------------------------------------
@@ -637,99 +634,201 @@ const Parser = struct {
     }
 };
 
+/// Reads a flow collection straight from the source lines: `line` is line
+/// `p.pos` and `i` the next byte in it. Comments inside the collection are
+/// dropped.
 const Flow = struct {
     p: *Parser,
-    s: []const u8,
-    i: usize = 0,
-    depth: u32 = 0,
+    line: []const u8,
+    i: usize,
+    /// Indent of the enclosing block node; further lines must go past it.
+    parent: i64,
 
-    fn skipWs(self: *Flow) void {
-        while (self.i < self.s.len and (self.s[self.i] == ' ' or self.s[self.i] == '\t')) self.i += 1;
+    fn peek(self: *const Flow) ?u8 {
+        return if (self.i < self.line.len) self.line[self.i] else null;
     }
 
-    fn value(self: *Flow) Error!Value {
-        self.skipWs();
-        if (self.i >= self.s.len) return self.p.err("expected a value in a flow collection");
-        if (self.depth >= self.p.options.max_depth) return self.p.fail("nesting too deep", error.LimitExceeded);
-        self.depth += 1;
-        defer self.depth -= 1;
-        switch (self.s[self.i]) {
-            '[' => return self.seq(),
-            '{' => return self.map(),
-            '"', '\'' => {
-                const end = scanQuoted(self.s[self.i..]) orelse return self.p.err("unterminated quoted scalar");
-                const q = self.s[self.i .. self.i + end];
-                self.i += end;
-                const t = try self.p.decodeQuoted(q);
-                return .{ .scalar = .{ .text = t, .style = if (q[0] == '"') .double else .single, .kind = .string } };
-            },
-            '&', '*', '!' => return self.p.unsupported("anchors, aliases and tags are not supported"),
-            else => {
-                const start = self.i;
-                while (self.i < self.s.len) : (self.i += 1) {
-                    const c = self.s[self.i];
-                    if (c == ',' or c == ']' or c == '}' or c == '[' or c == '{') break;
-                    if (c == ':' and (self.i + 1 == self.s.len or self.s[self.i + 1] == ' ' or self.s[self.i + 1] == ',' or self.s[self.i + 1] == ']' or self.s[self.i + 1] == '}')) break;
-                }
-                const t = std.mem.trim(u8, self.s[start..self.i], " \t");
-                const dup = try self.p.a.dupe(u8, t);
-                return .{ .scalar = .{ .text = dup, .style = .plain, .kind = model.resolve(dup) } };
-            },
+    fn skipInLine(self: *Flow) void {
+        while (self.i < self.line.len and (self.line[self.i] == ' ' or self.line[self.i] == '\t')) self.i += 1;
+    }
+
+    /// Skips blanks, comments and line breaks up to the next token.
+    fn skip(self: *Flow) Error!void {
+        while (true) {
+            self.skipInLine();
+            if (self.i < self.line.len) {
+                // A `#` is a comment only after a blank or at a line's start.
+                const comment = self.line[self.i] == '#' and
+                    (self.i == 0 or self.line[self.i - 1] == ' ' or self.line[self.i - 1] == '\t');
+                if (!comment) return;
+            }
+            self.p.pos += 1;
+            if (self.p.pos >= self.p.lines.len) return self.p.err("unterminated flow collection");
+            self.line = self.p.lines[self.p.pos];
+            self.i = 0;
+            const body = std.mem.trimStart(u8, self.line, " \t");
+            // Comment lines may be indented any amount.
+            if (body.len != 0 and body[0] != '#') try self.p.checkContinuation(self.line, self.parent);
         }
     }
 
+    /// True if the byte after the current one cannot continue a plain scalar.
+    fn separatorFollows(self: *const Flow) bool {
+        if (self.i + 1 >= self.line.len) return true;
+        return switch (self.line[self.i + 1]) {
+            ' ', '\t', ',', '[', ']', '{', '}' => true,
+            else => false,
+        };
+    }
+
+    fn node(self: *Flow) Error!Value {
+        const c = self.peek() orelse return self.p.err("expected a value in a flow collection");
+        switch (c) {
+            '[' => return self.seq(),
+            '{' => return self.map(),
+            '"', '\'' => {
+                const g = try self.p.gatherQuoted(self.line[self.i..], self.parent);
+                self.line = self.p.lines[self.p.pos];
+                self.i = self.line.len - g.tail.len;
+                const t = try self.p.decodeQuoted(g.quoted);
+                return .{ .scalar = .{ .text = t, .style = if (c == '"') .double else .single, .kind = .string } };
+            },
+            '&', '*', '!' => return self.p.unsupported("anchors, aliases and tags are not supported"),
+            ',', ']', '}' => return self.p.err("a flow collection entry cannot be empty"),
+            '|', '>', '%', '@', '`', '#' => return self.p.err("this character cannot start a value in a flow collection"),
+            '?', ':', '-' => {
+                if (self.separatorFollows()) {
+                    if (c == '?') return self.p.unsupported("complex keys are not supported");
+                    return self.p.err("this indicator cannot start a value in a flow collection");
+                }
+                return self.plain();
+            },
+            else => return self.plain(),
+        }
+    }
+
+    /// Consumes the part of a plain scalar that is on the current line, and
+    /// returns it without trailing blanks.
+    fn plainLine(self: *Flow) []const u8 {
+        const start = self.i;
+        while (self.i < self.line.len) : (self.i += 1) {
+            const c = self.line[self.i];
+            if (c == ',' or c == '[' or c == ']' or c == '{' or c == '}') break;
+            if (c == ':' and self.separatorFollows()) break;
+            if (c == '#' and self.i > start and (self.line[self.i - 1] == ' ' or self.line[self.i - 1] == '\t')) break;
+        }
+        return std.mem.trimEnd(u8, self.line[start..self.i], " \t");
+    }
+
+    fn plain(self: *Flow) Error!Value {
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(self.p.a, self.plainLine());
+        // It goes on while the following lines start with plain text.
+        while (self.i == self.line.len) {
+            var j = self.p.pos + 1;
+            while (j < self.p.lines.len and Parser.isBlank(self.p.lines[j])) j += 1;
+            if (j >= self.p.lines.len) break;
+            const next = self.p.lines[j];
+            const body = std.mem.trimStart(u8, next, " \t");
+            var probe: Flow = .{ .p = self.p, .line = body, .i = 0, .parent = self.parent };
+            switch (body[0]) {
+                ',', '[', ']', '{', '}', '#' => break,
+                ':' => if (probe.separatorFollows()) break,
+                else => {},
+            }
+            try self.p.checkContinuation(next, self.parent);
+            const blanks = j - self.p.pos - 1;
+            if (blanks == 0) try out.append(self.p.a, ' ') else try out.appendNTimes(self.p.a, '\n', blanks);
+            self.p.pos = j;
+            self.line = next;
+            self.i = next.len - body.len;
+            try out.appendSlice(self.p.a, self.plainLine());
+        }
+        const text = out.items;
+        return .{ .scalar = .{ .text = text, .style = .plain, .kind = model.resolve(text) } };
+    }
+
+    /// An entry of a flow mapping, or of a flow sequence that turns out to be
+    /// a single `key: value` pair.
+    const Entry = struct { key: Value, value: ?Value };
+
+    fn entry(self: *Flow, in_mapping: bool) Error!Entry {
+        const first_line = self.p.pos;
+        var key: Value = null_scalar;
+        var json_like = false;
+        const empty_key = self.peek() == ':' and self.separatorFollows();
+        if (!empty_key) {
+            const c = self.peek().?;
+            json_like = c == '"' or c == '\'' or c == '[' or c == '{';
+            key = try self.node();
+        }
+        // In a sequence, a pair's key and its `:` share one line.
+        if (in_mapping) try self.skip() else self.skipInLine();
+        // `"key":value` may leave out the blank after the colon.
+        if (self.peek() != ':' or !(json_like or self.separatorFollows())) return .{ .key = key, .value = null };
+        if (!in_mapping and self.p.pos != first_line) return self.p.err("a key in a flow sequence must be on one line");
+        self.i += 1;
+        try self.skip();
+        const c = self.peek().?;
+        const value = if (c == ',' or c == ']' or c == '}') null_scalar else try self.node();
+        return .{ .key = key, .value = value };
+    }
+
+    fn keyText(self: *Flow, key: Value) Error![]const u8 {
+        return switch (key) {
+            .scalar => |s| s.text,
+            else => self.p.unsupported("a collection as a key is not supported"),
+        };
+    }
+
+    /// Consumes the `,` after an entry, or stops before the closing bracket.
+    fn separator(self: *Flow, close: u8, msg: []const u8) Error!void {
+        try self.skip();
+        if (self.peek() == ',') {
+            self.i += 1;
+        } else if (self.peek() != close) return self.p.err(msg);
+    }
+
     fn seq(self: *Flow) Error!Value {
+        try self.p.enter();
+        defer self.p.depth -= 1;
         self.i += 1; // '['
         const s = try self.p.a.create(Seq);
         s.* = .{ .flow = true };
         while (true) {
-            self.skipWs();
-            if (self.i >= self.s.len) return self.p.err("unterminated flow sequence");
-            if (self.s[self.i] == ']') {
+            try self.skip();
+            if (self.peek() == ']') {
                 self.i += 1;
                 return .{ .seq = s };
             }
-            try s.append(self.p.a, try self.value());
-            self.skipWs();
-            if (self.i < self.s.len and self.s[self.i] == ',') {
-                self.i += 1;
-            } else if (self.i < self.s.len and self.s[self.i] == ']') {
-                continue;
-            } else return self.p.err("expected ',' or ']' in a flow sequence");
+            const e = try self.entry(false);
+            if (e.value) |v| {
+                const pair = try self.p.a.create(Map);
+                pair.* = .{ .flow = true };
+                try pair.entries.put(self.p.a, try self.keyText(e.key), v);
+                try s.append(self.p.a, .{ .map = pair });
+            } else try s.append(self.p.a, e.key);
+            try self.separator(']', "expected ',' or ']' in a flow sequence");
         }
     }
 
     fn map(self: *Flow) Error!Value {
+        try self.p.enter();
+        defer self.p.depth -= 1;
         self.i += 1; // '{'
         const m = try self.p.a.create(Map);
         m.* = .{ .flow = true };
         while (true) {
-            self.skipWs();
-            if (self.i >= self.s.len) return self.p.err("unterminated flow mapping");
-            if (self.s[self.i] == '}') {
+            try self.skip();
+            if (self.peek() == '}') {
                 self.i += 1;
                 return .{ .map = m };
             }
-            const k = try self.value();
-            const key = switch (k) {
-                .scalar => |sc| sc.text,
-                else => return self.p.err("a flow mapping key must be a scalar"),
-            };
+            const e = try self.entry(true);
+            const key = try self.keyText(e.key);
             if (m.entries.contains(key)) return self.p.err("duplicate key");
-            self.skipWs();
-            var v: Value = null_scalar;
-            if (self.i < self.s.len and self.s[self.i] == ':') {
-                self.i += 1;
-                self.skipWs();
-                if (self.i < self.s.len and self.s[self.i] != ',' and self.s[self.i] != '}') v = try self.value();
-            }
-            try m.entries.put(self.p.a, key, v);
-            self.skipWs();
-            if (self.i < self.s.len and self.s[self.i] == ',') {
-                self.i += 1;
-            } else if (self.i < self.s.len and self.s[self.i] == '}') {
-                continue;
-            } else return self.p.err("expected ',' or '}' in a flow mapping");
+            try m.entries.put(self.p.a, key, e.value orelse null_scalar);
+            try self.separator('}', "expected ',' or '}' in a flow mapping");
         }
     }
 };

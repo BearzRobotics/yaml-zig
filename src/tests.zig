@@ -295,3 +295,58 @@ test "continuation lines of a quoted scalar are checked" {
     try testing.expectEqualStrings("b\n--- c", doc.root.map.getString("a").?);
     try testing.expectEqualStrings("e\\ f", doc.root.map.getString("d").?);
 }
+
+/// Parses `src` and returns the string under the top-level key `a`.
+fn expectString(src: []const u8, want: []const u8) !void {
+    var doc = try parse(src);
+    defer doc.deinit();
+    try testing.expectEqualStrings(want, doc.root.map.getString("a").?);
+}
+
+/// Parses `src` and requires the writer to produce `want`.
+fn expectWritten(src: []const u8, want: []const u8) !void {
+    var doc = try parse(src);
+    defer doc.deinit();
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings(want, out);
+}
+
+test "quotes and line breaks inside flow collections" {
+    try expectWritten("a: [don't, it's]\nb: 2\n", "a: [don't, it's]\nb: 2\n");
+    try expectWritten("a: [\"x\n  # y\"]\n", "a: [\"x # y\"]\n");
+    try expectWritten("a: [\"x\n\n  y\"]\n", "a: [\"x\\ny\"]\n");
+    try expectWritten("a: [one\n  two\n\n  three, 4]\n", "a: [\"one two\\nthree\", 4]\n");
+}
+
+test "flow pairs, comments and a trailing comma" {
+    try expectWritten("a: [k: v, \"q\":w, : x]\n", "a: [{k: v}, {q: w}, {\"\": x}]\n");
+    try expectWritten("a: [1, # inner\n  2, ] # outer\n", "a: [1, 2] # outer\n");
+    try expectWritten("a: {x:\n  1,\n  y\n  : 2}\n", "a: {x: 1, y: 2}\n");
+}
+
+test "invalid flow collections are rejected" {
+    try rejects("a: [,]\n", error.Syntax);
+    try rejects("a: [x,,y]\n", error.Syntax);
+    try rejects("a: [-]\n", error.Syntax);
+    try rejects("a: [a,\nb]\n", error.Syntax);
+    try rejects("a: [a, b,#c\n  ]\n", error.Syntax);
+    try rejects("a: [a]#c\n", error.Syntax);
+    try rejects("[\n--- ,\n...\n]\n", error.Syntax);
+    try rejects("a: [x\n  y: z]\n", error.Syntax);
+    try rejects("a: {x: 1, x: 2}\n", error.Syntax);
+    try rejects("a: {? x: 1}\n", error.Unsupported);
+    try rejects("a: [&x 1]\n", error.Unsupported);
+    try rejects("a: {[b]: c}\n", error.Unsupported);
+    try rejects("[b]: c\n", error.Unsupported);
+}
+
+test "max_depth counts block and flow nesting together" {
+    const opts: yaml.Options = .{ .max_depth = 3 };
+    var ok = try yaml.Document.parse(testing.allocator, "a:\n  b: [1]\n", opts, null);
+    ok.deinit();
+    var ok_flow = try yaml.Document.parse(testing.allocator, "[[[x]]]\n", opts, null);
+    ok_flow.deinit();
+    try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, "a:\n  b: [[1]]\n", opts, null));
+    try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, "[[[[]]]]\n", opts, null));
+}
