@@ -73,10 +73,17 @@ pub fn parse(gpa: Allocator, arena: Allocator, source: []const u8, options: Opti
 
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(gpa);
-    var it = std.mem.splitScalar(u8, text, '\n');
-    while (it.next()) |l| {
-        if (it.peek() == null and l.len == 0) break;
-        try lines.append(gpa, std.mem.trimEnd(u8, l, "\r"));
+    // A line ends at LF, CR LF or a lone CR (`b-break`).
+    var start: usize = 0;
+    while (start < text.len) {
+        var end = start;
+        while (end < text.len and text[end] != '\n' and text[end] != '\r') : (end += 1) {
+            // No other control character may appear anywhere in a stream.
+            if (text[end] < 0x20 and text[end] != '\t') return failAt(diag, lines.items.len + 1, end - start + 1, "control character", error.Syntax);
+        }
+        try lines.append(gpa, text[start..end]);
+        start = end + 1;
+        if (end < text.len and text[end] == '\r' and start < text.len and text[start] == '\n') start += 1;
     }
 
     var p: Parser = .{ .a = arena, .gpa = gpa, .lines = lines.items, .options = options, .diag = diag };
@@ -144,7 +151,7 @@ const Parser = struct {
                 if (n != 0 and self.pending.items[n - 1].len == 0) continue;
                 try self.pending.append(self.gpa, "");
             } else if (l[indentOf(l)] == '#') {
-                try self.pending.append(self.gpa, try self.a.dupe(u8, std.mem.trimEnd(u8, l[indentOf(l)..], " \t")));
+                try self.pending.append(self.gpa, try self.keepComment(std.mem.trimEnd(u8, l[indentOf(l)..], " \t")));
             } else break;
         }
     }
@@ -157,6 +164,17 @@ const Parser = struct {
         if (ind < l.len and l[ind] == '\t') return self.err("a tab cannot indent a line");
         const sc = splitComment(l[ind..]);
         return .{ .indent = ind, .content = std.mem.trimEnd(u8, sc.content, " \t") };
+    }
+
+    /// Quoted scalars may hold any character that is not a C0 control; all
+    /// other text must be printable.
+    fn checkPrintable(self: *Parser, text: []const u8) Error!void {
+        if (model.findNonPrintable(text) != null) return self.err("non-printable character outside a quoted scalar");
+    }
+
+    fn keepComment(self: *Parser, text: []const u8) Error![]const u8 {
+        try self.checkPrintable(text);
+        return self.a.dupe(u8, text);
     }
 
     fn takeBefore(self: *Parser) Error![]const []const u8 {
@@ -267,7 +285,7 @@ const Parser = struct {
             var after: ?[]const u8 = null;
             const sc = splitComment(rest);
             if (std.mem.trim(u8, sc.content, " \t").len == 0) {
-                after = if (sc.comment) |t| try self.a.dupe(u8, t) else null;
+                after = if (sc.comment) |t| try self.keepComment(t) else null;
                 self.pos += 1;
                 try self.skipBlank();
                 if (try self.cur()) |nx| {
@@ -323,6 +341,7 @@ const Parser = struct {
             if (content[i] == ':' and (i + 1 == content.len or isWhite(content[i + 1]))) {
                 // The key may be empty (`: value`).
                 const key = std.mem.trimEnd(u8, content[0..i], " \t");
+                try self.checkPrintable(key);
                 return .{ .key = try self.a.dupe(u8, key), .rest = i + 1 };
             }
         }
@@ -347,7 +366,7 @@ const Parser = struct {
             var v: Value = undefined;
             var after: ?[]const u8 = null;
             if (std.mem.trim(u8, sc.content, " \t").len == 0) {
-                after = if (sc.comment) |t| try self.a.dupe(u8, t) else null;
+                after = if (sc.comment) |t| try self.keepComment(t) else null;
                 self.pos += 1;
                 try self.skipBlank();
                 const next = try self.cur();
@@ -429,7 +448,7 @@ const Parser = struct {
         const tail = splitPlain(g.tail);
         if (g.tail.len != 0 and g.tail[0] == '#') return self.err("a comment needs a blank before '#'");
         if (std.mem.trim(u8, tail.content, " \t").len != 0) return self.err("unexpected text after a quoted scalar");
-        self.trailing = if (tail.comment) |t| try self.a.dupe(u8, t) else null;
+        self.trailing = if (tail.comment) |t| try self.keepComment(t) else null;
         const s = try self.decodeQuoted(g.quoted);
         self.pos += 1;
         return .{ .scalar = .{ .text = s, .style = if (g.quoted[0] == '"') .double else .single, .kind = .string } };
@@ -472,8 +491,10 @@ const Parser = struct {
             comment = part.comment;
             self.pos = j + 1;
         }
-        self.trailing = if (comment) |t| try self.a.dupe(u8, t) else null;
+        self.trailing = if (comment) |t| try self.keepComment(t) else null;
         const text = out.items;
+        var parts = std.mem.splitScalar(u8, text, '\n');
+        while (parts.next()) |part| try self.checkPrintable(part);
         return .{ .scalar = .{ .text = text, .style = .plain, .kind = model.resolve(text) } };
     }
 
@@ -496,7 +517,7 @@ const Parser = struct {
             '1'...'9' => explicit = c - '0',
             else => return self.err("bad block scalar header"),
         };
-        self.trailing = if (sc.comment) |t| try self.a.dupe(u8, t) else null;
+        self.trailing = if (sc.comment) |t| try self.keepComment(t) else null;
         self.pos += 1;
 
         // The body is indented past the parent; its first non-blank line sets
@@ -524,6 +545,7 @@ const Parser = struct {
         var i = self.pos;
         while (i < body_end) : (i += 1) {
             const l = self.lines[i];
+            try self.checkPrintable(l);
             try lines.append(self.a, if (isBlank(l) or l.len <= ci) "" else l[ci..]);
         }
         self.pos = body_end;
@@ -579,7 +601,7 @@ const Parser = struct {
         if (rest.len != 0) {
             if (rest[0] == ':') return self.unsupported("a collection as a key is not supported");
             if (rest[0] != '#' or rest.len == tail.len) return self.err("unexpected text after a flow collection");
-            self.trailing = try self.a.dupe(u8, std.mem.trimEnd(u8, rest, " \t"));
+            self.trailing = try self.keepComment(std.mem.trimEnd(u8, rest, " \t"));
         }
         self.pos += 1;
         return v;
@@ -782,6 +804,8 @@ const Flow = struct {
             try out.appendSlice(self.p.a, self.plainLine());
         }
         const text = out.items;
+        var parts = std.mem.splitScalar(u8, text, '\n');
+        while (parts.next()) |part| try self.p.checkPrintable(part);
         return .{ .scalar = .{ .text = text, .style = .plain, .kind = model.resolve(text) } };
     }
 

@@ -440,3 +440,34 @@ test "indicators on a continuation line are plain text" {
     defer doc.deinit();
     try testing.expectEqualStrings("single multiline - sequence entry", doc.root.seq.items.items[0].scalar.text);
 }
+
+test "line breaks are LF, CR LF or CR" {
+    for ([_][]const u8{ "a: 1\r\nb: |\r\n  x\r\n  y\r\n", "a: 1\rb: |\r  x\r  y\r" }) |src| {
+        var doc = try parse(src);
+        defer doc.deinit();
+        try testing.expectEqual(@as(i64, 1), doc.root.map.getInt("a").?);
+        try testing.expectEqualStrings("x\ny\n", doc.root.map.getString("b").?);
+    }
+    // NEL and the Unicode separators are ordinary characters in YAML 1.2.
+    try expectString("a: x\u{2028}y\n", "x\u{2028}y");
+}
+
+test "a byte order mark is skipped" {
+    try expectString("\xEF\xBB\xBFa: x\n", "x");
+}
+
+test "non-printable characters" {
+    for ([_][]const u8{ "a: x\x00y\n", "a: \"\x01\"\n", "# \x07\na: 1\n", "a: x\x7Fy\n", "a: 1 # \u{80}\n", "x\x7F: 1\n", "a: [x\u{9f}]\n", "a: |\n  \u{fffe}\n" }) |src| {
+        try rejects(src, error.Syntax);
+    }
+    // Quoted scalars may hold anything but C0 controls; it is written escaped.
+    try expectWritten("a: \"\x7F\u{80}\u{ffff}\"\n", "a: \"\\x7F\\x80\\uFFFF\"\n");
+    try expectWritten("a: '\x7F'\n", "a: \"\\x7F\"\n");
+    try expectWritten("a: \"\\x01\\r\\0\"\n", "a: \"\\x01\\r\\x00\"\n");
+    var doc = try parse("a: 1\n");
+    defer doc.deinit();
+    for ([_][]const u8{ "# \x00", "# \n", "# \r", "# \x7F", "# \u{80}", "# \xff" }) |bad| {
+        try testing.expectError(error.InvalidComment, doc.setComments(&.{"a"}, .{ .after = bad }));
+        try testing.expectError(error.InvalidComment, doc.setComments(&.{"a"}, .{ .before = &.{bad} }));
+    }
+}

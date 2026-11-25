@@ -179,11 +179,10 @@ const Gen = struct {
 
     /// A block scalar holds text without control characters (apart from tab and newline).
     fn blockOk(text: []const u8) bool {
-        for (text) |c| {
-            if (c == '\n' or c == '\t') continue;
-            if (c < 0x20 or c == 0x7F) return false;
-        }
-        return std.unicode.utf8ValidateSlice(text);
+        if (!std.unicode.utf8ValidateSlice(text)) return false;
+        var lines_of = std.mem.splitScalar(u8, text, '\n');
+        while (lines_of.next()) |l| if (model.findNonPrintable(l) != null) return false;
+        return true;
     }
 
     /// `|` header (after a space the caller wrote), the comment, and the body
@@ -227,8 +226,9 @@ const Gen = struct {
     /// Characters and sequences that cannot appear in a plain scalar.
     fn plainBody(s: []const u8) bool {
         if (s[0] == ' ' or s[s.len - 1] == ' ' or s[s.len - 1] == ':') return false;
+        if (model.findNonPrintable(s) != null) return false;
         for (s, 0..) |c, i| {
-            if (c < 0x20 or c == 0x7F) return false;
+            if (c == '\t') return false;
             if (c == ':' and i + 1 < s.len and s[i + 1] == ' ') return false;
             if (c == '#' and i > 0 and s[i - 1] == ' ') return false;
         }
@@ -258,7 +258,7 @@ const Gen = struct {
                 try self.double(s.text);
             },
             .single => {
-                for (s.text) |c| if (c < 0x20 or c == 0x7F) return self.double(s.text);
+                if (model.findNonPrintable(s.text) != null or std.mem.indexOfScalar(u8, s.text, '\t') != null) return self.double(s.text);
                 try self.w.writeByte('\'');
                 for (s.text) |c| {
                     if (c == '\'') try self.w.writeByte('\'');
@@ -297,13 +297,22 @@ const Gen = struct {
                 i += 3;
                 continue;
             }
+            if (model.nonPrintableAt(t, i)) |np| {
+                switch (c) {
+                    '\n' => try w.writeAll("\\n"),
+                    '\r' => try w.writeAll("\\r"),
+                    else => if (np.codepoint <= 0xFF)
+                        try w.print("\\x{X:0>2}", .{np.codepoint})
+                    else
+                        try w.print("\\u{X:0>4}", .{np.codepoint}),
+                }
+                i += np.len;
+                continue;
+            }
             switch (c) {
                 '"' => try w.writeAll("\\\""),
                 '\\' => try w.writeAll("\\\\"),
-                '\n' => try w.writeAll("\\n"),
                 '\t' => try w.writeAll("\\t"),
-                '\r' => try w.writeAll("\\r"),
-                0...8, 11, 12, 14...0x1F, 0x7F => try w.print("\\x{X:0>2}", .{c}),
                 else => try w.writeByte(c),
             }
             i += 1;

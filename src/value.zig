@@ -143,9 +143,36 @@ pub const Comments = struct {
     }
 };
 
+/// The offset of the first character outside YAML 1.2.2 `c-printable` (line
+/// breaks count as outside it here), or null. `s` must be valid UTF-8.
+pub fn findNonPrintable(s: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < s.len) {
+        if (nonPrintableAt(s, i) != null) return i;
+        i += 1;
+    }
+    return null;
+}
+
+pub const NonPrintable = struct { codepoint: u21, len: usize };
+
+/// The non-printable character that starts at byte `i` of valid UTF-8, if one does.
+pub fn nonPrintableAt(s: []const u8, i: usize) ?NonPrintable {
+    const c = s[i];
+    if (c == '\t') return null;
+    if (c < 0x20 or c == 0x7F) return .{ .codepoint = c, .len = 1 };
+    // C1 controls except next line (U+0085): C2 80 .. C2 9F.
+    if (c == 0xC2 and i + 1 < s.len and s[i + 1] >= 0x80 and s[i + 1] <= 0x9F and s[i + 1] != 0x85)
+        return .{ .codepoint = s[i + 1], .len = 2 };
+    // U+FFFE and U+FFFF: EF BF BE and EF BF BF.
+    if (c == 0xEF and i + 2 < s.len and s[i + 1] == 0xBF and s[i + 2] >= 0xBE)
+        return .{ .codepoint = if (s[i + 2] == 0xBE) 0xFFFE else 0xFFFF, .len = 3 };
+    return null;
+}
+
 /// A comment line must be empty or start with `#` (after blanks); a trailing
-/// comment must start with `#`; neither may contain a line break or control
-/// character other than tab.
+/// comment must start with `#`; both must be valid UTF-8 without line breaks
+/// or non-printable characters.
 pub fn checkComments(c: Comments) error{InvalidComment}!void {
     for (c.before) |l| {
         if (l.len != 0) try checkLine(std.mem.trimStart(u8, l, " \t"));
@@ -155,10 +182,7 @@ pub fn checkComments(c: Comments) error{InvalidComment}!void {
 
 fn checkLine(l: []const u8) error{InvalidComment}!void {
     if (l.len == 0 or l[0] != '#') return error.InvalidComment;
-    for (l) |ch| {
-        if (ch == '\t') continue;
-        if (ch < 0x20 or ch == 0x7F) return error.InvalidComment;
-    }
+    if (!std.unicode.utf8ValidateSlice(l) or findNonPrintable(l) != null) return error.InvalidComment;
 }
 
 pub const Seq = struct {
