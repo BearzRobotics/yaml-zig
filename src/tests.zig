@@ -717,3 +717,13 @@ test "Map.setComments needs an existing key and does not keep the caller's" {
     try map.setComments(doc.allocator(), "a", .{});
     try testing.expectEqual(@as(?yaml.Comments, null), map.commentsOf("a"));
 }
+
+test "output is stable from the first write" {
+    for ([_][]const u8{ "- \n\n k: \n", "-  # c  \n\n  x\n", "- \n  \n  k: \n" }) |src| {
+        var doc = try parse(src);
+        defer doc.deinit();
+        const out = try doc.toOwnedString(testing.allocator);
+        defer testing.allocator.free(out);
+        try roundTrips(out);
+    }
+}
