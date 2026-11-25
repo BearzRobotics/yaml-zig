@@ -79,7 +79,7 @@ const Gen = struct {
                     return;
                 }
                 if (s.kind == .null and s.text.len == 0) return self.w.writeAll("null\n");
-                try self.scalarInline(s, false);
+                if (s.style == .plain and looksLikeMarker(s.text)) try self.double(s.text) else try self.scalarInline(s, false);
                 try self.w.writeByte('\n');
             },
             else => {
@@ -98,7 +98,7 @@ const Gen = struct {
                 try self.lines(c.before, indent);
                 try self.pad(indent);
             }
-            try self.key(k);
+            if (indent == 0 and looksLikeMarker(k)) try self.double(k) else try self.key(k);
             try self.w.writeByte(':');
             try self.entryValue(v, c.after, indent);
         }
@@ -172,6 +172,12 @@ const Gen = struct {
     }
 
     // ---- scalars ---------------------------------------------------------------
+
+    /// Written at column 0, such text would be read as `---` or `...`.
+    fn looksLikeMarker(s: []const u8) bool {
+        if (!std.mem.startsWith(u8, s, "---") and !std.mem.startsWith(u8, s, "...")) return false;
+        return s.len == 3 or s[3] == ' ' or s[3] == '\t';
+    }
 
     fn isBlock(s: Scalar) bool {
         return s.style == .literal or s.style == .folded;

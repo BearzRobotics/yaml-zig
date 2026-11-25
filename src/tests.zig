@@ -517,3 +517,30 @@ test "escaped line breaks" {
     try expectString("a: \"foo \\\n  \n  bar\"\n", "foo \nbar");
     try expectString("a: \"x\\t\\\n\n\n  y\"\n", "x\t\n\ny");
 }
+
+/// Writes `doc`, reads the result and returns it.
+fn writeAndRead(doc: *const yaml.Document) !yaml.Document {
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    return parse(out);
+}
+
+test "text that looks like a document marker is quoted at column 0" {
+    for ([_][]const u8{ "---", "...", "--- x", "... x" }) |text| {
+        var doc = try yaml.Document.init(testing.allocator);
+        defer doc.deinit();
+        doc.root = try doc.string(text);
+        var root_back = try writeAndRead(&doc);
+        defer root_back.deinit();
+        try testing.expectEqualStrings(text, root_back.root.scalar.text);
+
+        var keyed = try yaml.Document.init(testing.allocator);
+        defer keyed.deinit();
+        try keyed.set(&.{text}, try keyed.string(text));
+        var key_back = try writeAndRead(&keyed);
+        defer key_back.deinit();
+        try testing.expectEqualStrings(text, key_back.root.map.getString(text).?);
+    }
+    // Away from column 0 it stays as it was written.
+    try roundTrips("a: ...\n");
+}
