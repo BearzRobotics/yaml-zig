@@ -227,8 +227,6 @@ test "strings that need quoting are quoted" {
 test "unsupported and invalid input is rejected" {
     try rejects("a: &x 1\n", error.Unsupported);
     try rejects("a: *x\n", error.Unsupported);
-    try rejects("%YAML 1.2\n---\na: 1\n", error.Unsupported);
-    try rejects("# c\n%TAG ! tag:x,2000:\n--- a\n", error.Unsupported);
     try rejects("a: !!str 1\n", error.Unsupported);
     try rejects("? a\n: b\n", error.Unsupported);
     try rejects("a: 1\n---\nb: 2\n", error.Unsupported);
@@ -270,6 +268,13 @@ fn parseAndWrite(gpa: std.mem.Allocator, src: []const u8) !void {
     gpa.free(out);
 }
 
+fn streamAndWrite(gpa: std.mem.Allocator, src: []const u8) !void {
+    var stream = try yaml.Stream.parse(gpa, src, .{}, null);
+    defer stream.deinit();
+    const out = try stream.toOwnedString(gpa);
+    gpa.free(out);
+}
+
 fn buildAndEdit(gpa: std.mem.Allocator) !void {
     var doc = try yaml.Document.init(gpa);
     defer doc.deinit();
@@ -300,6 +305,8 @@ test "no leaks or swallowed errors on allocation failure" {
         "# root\n[1] # c\n",
     };
     for (sources) |src| try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{src});
+    try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "%YAML 1.2\n---\na: [1]\n# c\n...\n# d\n---\nb\n---\n")});
+    try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "# nothing\n")});
     try testing.checkAllAllocationFailures(testing.allocator, buildAndEdit, .{});
     try testing.checkAllAllocationFailures(testing.allocator, readAll, .{});
 }
@@ -346,6 +353,28 @@ test "every accepted input survives writing" {
         defer testing.allocator.free(again);
         try testing.expectEqualStrings(out, again);
     }
+    // The same for whole streams, which have more ways to join documents.
+    const stream_tokens = tokens ++ [_][]const u8{ "---\n", "...\n", "%YAML 1.2\n", "%TAG !e! x:\n", "\n---\n", "\n...\n" };
+    for (0..40_000) |_| {
+        buf.clearRetainingCapacity();
+        for (0..rnd.uintLessThan(usize, 18)) |_| try buf.appendSlice(testing.allocator, stream_tokens[rnd.uintLessThan(usize, stream_tokens.len)]);
+        var stream = yaml.Stream.parse(testing.allocator, buf.items, .{}, null) catch continue;
+        defer stream.deinit();
+        errdefer std.debug.print("stream input: \"{f}\"\n", .{std.zig.fmtString(buf.items)});
+        const out = try stream.toOwnedString(testing.allocator);
+        defer testing.allocator.free(out);
+        var back = try parseStream(out);
+        defer back.deinit();
+        try testing.expectEqual(stream.documents.len, back.documents.len);
+        for (stream.documents, back.documents) |x, y| {
+            try expectSame(x.root, y.root);
+            try testing.expectEqual(x.directives.len, y.directives.len);
+        }
+        const again = try back.toOwnedString(testing.allocator);
+        defer testing.allocator.free(again);
+        try testing.expectEqualStrings(out, again);
+    }
+
     // Guards the test itself: it means nothing if little parses.
     try testing.expect(accepted > 5_000);
 }
@@ -498,7 +527,7 @@ test "anchors, tags and aliases on keys are refused, not read as text" {
     try rejects("?\ta\n", error.Unsupported);
     try rejects("@a: 1\n", error.Syntax);
     try rejects("`a: 1\n", error.Syntax);
-    try rejects("%a: 1\nb: 2\n", error.Unsupported); // a directive line
+    try rejects("%a: 1\nb: 2\n", error.Syntax); // a directive without its `---`
     try rejects("b: 2\n%a: 1\n", error.Syntax);
 }
 
@@ -1014,5 +1043,111 @@ test "a closing bracket may stand in the parent's column" {
 test "a block key cannot start with a flow indicator" {
     for ([_][]const u8{ "}x: y\n", "]x: y\n", ",x: y\n", "- }x: y\n", "a: 1\n,b: 2\n" }) |src| {
         try rejects(src, error.Syntax);
+    }
+}
+
+fn parseStream(src: []const u8) !yaml.Stream {
+    var diag: yaml.Diagnostic = .{};
+    return yaml.Stream.parse(testing.allocator, src, .{}, &diag) catch |e| {
+        std.debug.print("unexpected failure on:\n{s}\n-> {f}\n", .{ src, diag });
+        return e;
+    };
+}
+
+/// Parses `src` as a stream and requires `want` as output, which must then be
+/// written the same again.
+fn expectStream(src: []const u8, documents: usize, want: []const u8) !void {
+    for ([_][]const u8{ src, want }) |text| {
+        var stream = try parseStream(text);
+        defer stream.deinit();
+        try testing.expectEqual(documents, stream.documents.len);
+        const out = try stream.toOwnedString(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings(want, out);
+    }
+}
+
+fn rejectsStream(src: []const u8, want: anyerror) !void {
+    try testing.expectError(want, yaml.Stream.parse(testing.allocator, src, .{}, null));
+}
+
+test "a stream of several documents" {
+    try expectStream("a: 1\n---\nb: 2\n", 2, "a: 1\n---\nb: 2\n");
+    try expectStream("---\n---\n---\n", 3, "---\nnull\n---\nnull\n---\nnull\n");
+    try expectStream("a\n...\nb\n...\n", 2, "a\n...\nb\n");
+    try expectStream("a: 1\n...\n---\nb: |+\n  x\n\n--- c\n", 3, "a: 1\n...\n---\nb: |+\n  x\n\n---\nc\n");
+    try expectStream("", 0, "");
+    try expectStream("# only\n\n# comments\n", 0, "# only\n\n# comments\n");
+    try expectStream("...\n...\n", 0, "");
+
+    var stream = try parseStream("--- 1\n--- [two]\n--- |\n  3\n---\nk: 4\n");
+    defer stream.deinit();
+    try testing.expectEqual(@as(usize, 4), stream.documents.len);
+    try testing.expectEqual(@as(?i64, 1), stream.documents[0].root.scalar.asInt());
+    try testing.expectEqualStrings("3\n", stream.documents[2].root.scalar.text);
+    try testing.expectEqual(@as(?i64, 4), stream.documents[3].root.map.getInt("k"));
+}
+
+test "comments stay with their document" {
+    const src = "# one\na: 1 # x\n# end of one\n...\n# two\n--- # start\nb: 2\n# before three\n---\nc: 3\n# last\n";
+    try expectStream(src, 3, "# one\na: 1 # x\n# end of one\n...\n# two\n--- # start\nb: 2\n# before three\n---\nc: 3\n# last\n");
+    var stream = try parseStream(src);
+    defer stream.deinit();
+    try testing.expectEqualStrings("# end of one", stream.documents[0].footer[0]);
+    try testing.expectEqualStrings("# two", stream.documents[1].header[0]);
+    try testing.expectEqualStrings("# before three", stream.documents[2].header[0]);
+    try testing.expectEqualStrings("# last", stream.documents[2].footer[0]);
+}
+
+test "each document stands alone, with its own indentation" {
+    var stream = try parseStream("a:\n    b: 1\n---\nc:\n  d: 2\n");
+    defer stream.deinit();
+    try testing.expectEqual(@as(u8, 4), stream.documents[0].indent);
+    try testing.expectEqual(@as(u8, 2), stream.documents[1].indent);
+    // One document can be edited and written by itself.
+    try stream.documents[1].set(&.{ "c", "d" }, try stream.documents[1].integer(3));
+    const one = try stream.documents[1].toOwnedString(testing.allocator);
+    defer testing.allocator.free(one);
+    try testing.expectEqualStrings("---\nc:\n  d: 3\n", one);
+}
+
+test "Document.parse still takes one document" {
+    try rejects("a: 1\n---\nb: 2\n", error.Unsupported);
+    try rejects("a\n...\nb\n", error.Unsupported);
+    try rejects("---\n---\n", error.Unsupported);
+}
+
+test "directives" {
+    try expectStream("%YAML 1.2\n%TAG !e! tag:example.com,2000: # why\n---\na: 1\n", 1, "%YAML 1.2\n%TAG !e! tag:example.com,2000: # why\n---\na: 1\n");
+    try expectStream("a\n...\n%YAML 1.1\n---\nb\n", 2, "a\n...\n%YAML 1.1\n---\nb\n");
+    try expectStream("%FOO bar baz\n--- x\n", 1, "%FOO bar baz\n---\nx\n");
+    // Without '...', a line starting with '%' belongs to the scalar above.
+    try expectStream("---\nscalar\n%YAML 1.2\n", 1, "---\nscalar %YAML 1.2\n");
+
+    var doc = try parse("%YAML 1.2\n---\na: 1\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("%YAML 1.2", doc.directives[0]);
+    // A document with directives is always written with its '---'.
+    doc.explicit_start = false;
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("%YAML 1.2\n---\na: 1\n", out);
+    doc.directives = &.{"%YAML 2.0"};
+    try testing.expectError(error.InvalidDirective, doc.toOwnedString(testing.allocator));
+    doc.directives = &.{"%FOO\nb: 2"};
+    try testing.expectError(error.InvalidDirective, doc.toOwnedString(testing.allocator));
+}
+
+test "invalid directives and streams" {
+    for ([_][]const u8{
+        "%YAML 1.2\n",                 "%YAML 1.2\na: 1\n",      "%YAML 1.2\n...\n",
+        "%YAML 1.2\n%YAML 1.2\n---\n", "%YAML 2.0\n---\n",       "%YAML 1.2 x\n---\n",
+        "%YAML 1.2#c\n---\n",          "%YAML\n---\n",           "%TAG !a! x\n%TAG !a! x\n---\n",
+        "%TAG a x\n---\n",             "%TAG !a_b! x\n---\n",    "%TAG ! {x\n---\n",
+        "%\n---\n",                    "a: 1\n%YAML 1.2\n---\n", "a: 1\n... x\n",
+        "a: 1\n---\nb: [\n",
+    }) |src| {
+        errdefer std.debug.print("source: {s}\n", .{src});
+        try rejectsStream(src, error.Syntax);
     }
 }

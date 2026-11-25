@@ -23,7 +23,7 @@ const Seq = model.Seq;
 const Map = model.Map;
 const Comments = model.Comments;
 
-pub const Error = Writer.Error || error{ InvalidUtf8, NestingTooDeep };
+pub const Error = Writer.Error || error{ InvalidUtf8, NestingTooDeep, InvalidDirective };
 
 pub const Doc = struct {
     root: Value,
@@ -33,35 +33,42 @@ pub const Doc = struct {
     footer: []const []const u8,
     root_comments: Comments = .{},
     start_comment: ?[]const u8 = null,
+    directives: []const []const u8 = &.{},
+    explicit_end: bool = false,
     max_depth: u32,
 };
 
+/// Writes one document on its own. Its end needs no marker.
 pub fn write(w: *Writer, doc: Doc) Error!void {
-    // Values and keys can be built by hand, so the whole tree is checked
-    // before anything is written.
+    try check(doc);
+    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1) };
+    try g.document(doc, doc.explicit_start or doc.directives.len != 0);
+}
+
+/// Checks everything about `doc` that can make writing it fail, other than
+/// the output itself. Values and keys can be built by hand, so nothing is
+/// written before the whole tree has passed.
+pub fn check(doc: Doc) error{ InvalidUtf8, NestingTooDeep, InvalidDirective }!void {
     try checkTree(doc.root, doc.max_depth);
     try checkComment(.{ .before = doc.header });
     try checkComment(.{ .before = doc.footer });
     try checkComment(doc.root_comments);
     try checkComment(.{ .after = doc.start_comment });
-    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1) };
-    try g.lines(doc.header, 0);
-    if (doc.explicit_start) {
-        try w.writeAll("---");
-        try g.tail(doc.start_comment);
-    }
-    try g.lines(doc.root_comments.before, 0);
-    const after = doc.root_comments.after;
-    if (isInline(doc.root)) try g.rootInline(doc.root, after) else {
-        // A block collection has no line of its own for a trailing comment.
-        if (after) |a| try g.lines(&.{a}, 0);
-        switch (doc.root) {
-            .map => |m| try g.map(m, 0, false),
-            .seq => |q| try g.seq(q, 0),
-            .scalar => unreachable,
-        }
-    }
-    try g.lines(doc.footer, 0);
+    for (doc.directives) |line| _ = model.parseDirective(line) catch return error.InvalidDirective;
+}
+
+/// Writes the next document of a stream; `check` it first. `previous_ended`
+/// says whether the one before was closed with `...`, and `next` is the one
+/// that follows. Returns whether this one was closed.
+pub fn writeInStream(w: *Writer, doc: Doc, index: usize, previous_ended: bool, next: ?Doc) Error!bool {
+    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1), .drop_blank = index == 0 };
+    // Only `---` or `...` keeps two documents apart.
+    const start = doc.explicit_start or doc.directives.len != 0 or (index != 0 and !previous_ended);
+    try g.document(doc, start);
+    // Directives may only follow `...`.
+    const end = if (next) |n| doc.explicit_end or n.directives.len != 0 else false;
+    if (end) try w.writeAll("...\n");
+    return end;
 }
 
 fn checkText(s: []const u8) error{InvalidUtf8}!void {
@@ -123,6 +130,30 @@ const Gen = struct {
     /// output (the reader drops them, so a second write would differ) and
     /// after a block scalar with keep chomping (they would join its value).
     drop_blank: bool = true,
+
+    fn document(self: *Gen, doc: Doc, start: bool) Error!void {
+        try self.lines(doc.header, 0);
+        for (doc.directives) |line| {
+            try self.w.writeAll(line);
+            try self.w.writeByte('\n');
+        }
+        if (start) {
+            try self.w.writeAll("---");
+            try self.tail(doc.start_comment);
+        }
+        try self.lines(doc.root_comments.before, 0);
+        const after = doc.root_comments.after;
+        if (isInline(doc.root)) try self.rootInline(doc.root, after) else {
+            // A block collection has no line of its own for a trailing comment.
+            if (after) |a| try self.lines(&.{a}, 0);
+            switch (doc.root) {
+                .map => |m| try self.map(m, 0, false),
+                .seq => |q| try self.seq(q, 0),
+                .scalar => unreachable,
+            }
+        }
+        try self.lines(doc.footer, 0);
+    }
 
     /// Starts a line that is not empty.
     fn pad(self: *Gen, n: usize) Error!void {

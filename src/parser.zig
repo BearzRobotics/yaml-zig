@@ -74,35 +74,81 @@ pub const Result = struct {
     root_comments: Comments = .{},
     /// The comment on the `---` line.
     start_comment: ?[]const u8 = null,
+    /// The directive lines above `---`, as written.
+    directives: []const []const u8 = &.{},
+    /// The document was closed with `...`.
+    explicit_end: bool = false,
 };
 
 const null_scalar: Value = .{ .scalar = .{ .text = "", .style = .plain, .kind = .null } };
 
-pub fn parse(gpa: Allocator, arena: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) Error!Result {
-    if (source.len > options.max_bytes) return failAt(diag, 1, 1, "input too large", error.LimitExceeded);
-    if (!std.unicode.utf8ValidateSlice(source)) return failAt(diag, 1, 1, "invalid UTF-8", error.InvalidUtf8);
-    var text = source;
-    if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text = text[3..];
+/// Reads the documents of a stream one at a time. Each can go into an arena of
+/// its own.
+pub const Reader = struct {
+    parser: Parser,
+    lines: std.ArrayList([]const u8),
 
-    var lines: std.ArrayList([]const u8) = .empty;
-    defer lines.deinit(gpa);
-    // A line ends at LF, CR LF or a lone CR (`b-break`).
-    var start: usize = 0;
-    while (start < text.len) {
-        var end = start;
-        while (end < text.len and text[end] != '\n' and text[end] != '\r') : (end += 1) {
-            // No other control character may appear anywhere in a stream.
-            if (text[end] < 0x20 and text[end] != '\t') return failAt(diag, lines.items.len + 1, end - start + 1, "control character", error.Syntax);
+    /// `source` must stay as it is while the reader is used.
+    pub fn init(gpa: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) Error!Reader {
+        if (source.len > options.max_bytes) return failAt(diag, 1, 1, "input too large", error.LimitExceeded);
+        if (!std.unicode.utf8ValidateSlice(source)) return failAt(diag, 1, 1, "invalid UTF-8", error.InvalidUtf8);
+        var text = source;
+        if (std.mem.startsWith(u8, text, byte_order_mark)) text = text[byte_order_mark.len..];
+
+        var lines: std.ArrayList([]const u8) = .empty;
+        errdefer lines.deinit(gpa);
+        // A line ends at LF, CR LF or a lone CR (`b-break`).
+        var start: usize = 0;
+        while (start < text.len) {
+            var end = start;
+            while (end < text.len and text[end] != '\n' and text[end] != '\r') : (end += 1) {
+                // No other control character may appear anywhere in a stream.
+                if (text[end] < 0x20 and text[end] != '\t') return failAt(diag, lines.items.len + 1, end - start + 1, "control character", error.Syntax);
+            }
+            try lines.append(gpa, text[start..end]);
+            start = end + 1;
+            if (end < text.len and text[end] == '\r' and start < text.len and text[start] == '\n') start += 1;
         }
-        try lines.append(gpa, text[start..end]);
-        start = end + 1;
-        if (end < text.len and text[end] == '\r' and start < text.len and text[start] == '\n') start += 1;
+        return .{
+            .parser = .{ .a = undefined, .gpa = gpa, .lines = lines.items, .options = options, .diag = diag },
+            .lines = lines,
+        };
     }
 
-    var p: Parser = .{ .a = arena, .gpa = gpa, .lines = lines.items, .options = options, .diag = diag };
-    defer p.pending.deinit(gpa);
-    defer p.scratch.deinit(gpa);
-    return p.document();
+    pub fn deinit(self: *Reader) void {
+        self.parser.pending.deinit(self.parser.gpa);
+        self.parser.scratch.deinit(self.parser.gpa);
+        self.lines.deinit(self.parser.gpa);
+    }
+
+    /// The next document, allocated in `arena`, or null at the end of the
+    /// stream.
+    pub fn next(self: *Reader, arena: Allocator) Error!?Result {
+        self.parser.a = arena;
+        return self.parser.document();
+    }
+
+    /// The comments left over at the end of a stream with no document to
+    /// take them.
+    pub fn leftover(self: *Reader, arena: Allocator) Error![]const []const u8 {
+        self.parser.a = arena;
+        return self.parser.footerLines(self.parser.pending.items.len);
+    }
+};
+
+const byte_order_mark = "\xEF\xBB\xBF";
+
+/// Reads a stream that holds at most one document.
+pub fn parse(gpa: Allocator, arena: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) Error!Result {
+    var reader = try Reader.init(gpa, source, options, diag);
+    defer reader.deinit();
+    const result = try reader.next(arena) orelse
+        return .{ .root = null_scalar, .indent = 2, .explicit_start = false, .header = &.{}, .footer = try reader.leftover(arena) };
+    // Anything further would be another document.
+    try reader.parser.skipBlank();
+    if (reader.parser.pos < reader.parser.lines.len)
+        return reader.parser.unsupported("several documents: read them with Stream.parse");
+    return result;
 }
 
 fn failAt(diag: ?*Diagnostic, line: usize, col: usize, msg: []const u8, err: Error) Error {
@@ -126,7 +172,11 @@ const Parser = struct {
     pos: usize = 0,
     options: Options,
     diag: ?*Diagnostic,
+    /// Comment and blank lines not yet given to anything. They point into the
+    /// source: which document's arena they belong in is not yet known.
     pending: std.ArrayList([]const u8) = .empty,
+    /// At the start of the stream or after `...`: directives may follow.
+    after_end: bool = true,
     /// Where the text of one scalar is put together before it is copied to the
     /// arena. Reused, so that a document with many scalars does not allocate
     /// and free a buffer for each.
@@ -185,7 +235,8 @@ const Parser = struct {
             } else {
                 const body = std.mem.trim(u8, l, " \t");
                 if (body[0] != '#') break;
-                try self.pending.append(self.gpa, try self.keepComment(body));
+                try self.checkPrintable(body);
+                try self.pending.append(self.gpa, body);
             }
         }
     }
@@ -216,8 +267,24 @@ const Parser = struct {
             self.pending.clearRetainingCapacity();
             self.seen_item = true;
         }
-        if (self.pending.items.len == 0) return &.{};
-        return self.a.dupe([]const u8, self.pending.items);
+        return self.dupeLines(self.pending.items);
+    }
+
+    fn dupeLines(self: *Parser, lines: []const []const u8) Error![]const []const u8 {
+        if (lines.len == 0) return &.{};
+        const out = try self.a.alloc([]const u8, lines.len);
+        for (lines, out) |line, *o| o.* = try self.a.dupe(u8, line);
+        return out;
+    }
+
+    /// Takes the first `count` pending lines as a footer, without the empty
+    /// lines at its end.
+    fn footerLines(self: *Parser, count: usize) Error![]const []const u8 {
+        var n = count;
+        while (n > 0 and self.pending.items[n - 1].len == 0) n -= 1;
+        const footer = try self.dupeLines(self.pending.items[0..n]);
+        self.pending.replaceRangeAssumeCapacity(0, count, &.{});
+        return footer;
     }
 
     /// Takes the document's indentation step from the first block collection
@@ -262,23 +329,59 @@ const Parser = struct {
 
     // ---- document ----------------------------------------------------------------
 
-    fn document(self: *Parser) Error!Result {
+    /// The next document of the stream, or null if there is none.
+    fn document(self: *Parser) Error!?Result {
         var res: Result = .{ .root = null_scalar, .indent = 2, .explicit_start = false, .header = &.{}, .footer = &.{} };
-        try self.skipBlank();
+        self.step = 0;
+
+        // The prefix: `...` lines left over, and directives.
+        var directives: std.ArrayList([]const u8) = .empty;
+        var seen_yaml = false;
+        var handles: std.StringHashMapUnmanaged(void) = .empty;
+        const first = while (true) {
+            // A byte order mark may start any document.
+            if (self.after_end and self.pos < self.lines.len and std.mem.startsWith(u8, self.lines[self.pos], byte_order_mark))
+                try self.dropByteOrderMark();
+            try self.skipBlank();
+            const c = (try self.cur()) orelse {
+                if (directives.items.len != 0) return self.err("directives must be followed by '---'");
+                return null;
+            };
+            if (isDocMarker(c) and c.content[0] == '.') {
+                if (directives.items.len != 0) return self.err("directives must be followed by '---'");
+                try self.endMarker(c);
+                self.after_end = true;
+            } else if (self.after_end and c.indent == 0 and !c.tabbed and c.content.len != 0 and c.content[0] == '%') {
+                const line = std.mem.trimEnd(u8, self.lines[self.pos], " \t");
+                switch (model.parseDirective(line) catch return self.err("bad directive")) {
+                    .yaml => {
+                        if (seen_yaml) return self.err("a second %YAML directive");
+                        seen_yaml = true;
+                    },
+                    .tag => |t| {
+                        if ((try handles.getOrPut(self.a, t.handle)).found_existing) return self.err("a second %TAG directive for one handle");
+                    },
+                    .reserved => {},
+                }
+                try directives.append(self.a, try self.a.dupe(u8, line));
+                self.pos += 1;
+            } else break c;
+        };
+        res.directives = directives.items;
+        self.after_end = false;
+
         // Content that shares its line with `---`.
         var inline_root: ?[]const u8 = null;
-        if (try self.cur()) |c| {
-            if (isDocMarker(c) and c.content[0] == '-') {
-                res.explicit_start = true;
-                if (self.pending.items.len != 0) res.header = try self.a.dupe([]const u8, self.pending.items);
-                self.pending.clearRetainingCapacity();
-                const rest = std.mem.trimStart(u8, self.lines[self.pos][3..], " \t");
-                if (rest.len == 0 or rest[0] == '#') {
-                    if (rest.len != 0) res.start_comment = try self.keepComment(std.mem.trimEnd(u8, rest, " \t"));
-                    self.pos += 1;
-                } else inline_root = rest;
-            } else if (c.indent == 0 and c.content[0] == '%') return self.unsupported("directives are not supported");
-        }
+        if (isDocMarker(first)) {
+            res.explicit_start = true;
+            res.header = try self.dupeLines(self.pending.items);
+            self.pending.clearRetainingCapacity();
+            const rest = std.mem.trimStart(u8, self.lines[self.pos][3..], " \t");
+            if (rest.len == 0 or rest[0] == '#') {
+                if (rest.len != 0) res.start_comment = try self.keepComment(std.mem.trimEnd(u8, rest, " \t"));
+                self.pos += 1;
+            } else inline_root = rest;
+        } else if (directives.items.len != 0) return self.err("directives must be followed by '---'");
         if (inline_root) |rest| {
             const on_marker_line = "a block collection cannot start on the '---' line";
             if (isSeqEntry(rest)) return self.err(on_marker_line);
@@ -297,24 +400,50 @@ const Parser = struct {
             }
         }
         try self.skipBlank();
+        // Comments up to here, and on a first `...`, end this document. Any
+        // after that go to the next one, if there is one.
+        var own = self.pending.items.len;
         if (try self.cur()) |c| {
             if (!isDocMarker(c)) return self.err("unexpected content or bad indentation");
-            if (c.content[0] == '-') return self.unsupported("several documents are not supported");
-            // `...` ends the document. It may be repeated.
-            while (try self.cur()) |end| {
-                if (!isDocMarker(end) or end.content[0] != '.') return self.unsupported("several documents are not supported");
-                if (end.content.len != 3) return self.err("unexpected content after '...'");
-                // `...` is not written back; its comment becomes a footer line.
-                if (splitPlain(self.lines[self.pos][3..]).comment) |t| try self.pending.append(self.gpa, try self.keepComment(t));
-                self.pos += 1;
-                try self.skipBlank();
+            if (c.content[0] == '-') {
+                // Comments above the next `---` are that document's header.
+                own = 0;
+            } else {
+                res.explicit_end = true;
+                self.after_end = true;
+                try self.endMarker(c);
+                own = self.pending.items.len;
+                while (true) {
+                    try self.skipBlank();
+                    const end = (try self.cur()) orelse {
+                        own = self.pending.items.len;
+                        break;
+                    };
+                    if (!isDocMarker(end) or end.content[0] != '.') break;
+                    try self.endMarker(end);
+                }
             }
         }
-        var n = self.pending.items.len;
-        while (n > 0 and self.pending.items[n - 1].len == 0) n -= 1;
-        if (n != 0) res.footer = try self.a.dupe([]const u8, self.pending.items[0..n]);
+        res.footer = try self.footerLines(own);
         if (self.step != 0) res.indent = self.step;
         return res;
+    }
+
+    /// Consumes the `...` line `c`. The marker is optional and is not written
+    /// back, so its comment becomes a comment line.
+    fn endMarker(self: *Parser, c: Cur) Error!void {
+        if (c.content.len != 3) return self.err("unexpected content after '...'");
+        if (splitPlain(self.lines[self.pos][3..]).comment) |t| {
+            try self.checkPrintable(t);
+            try self.pending.append(self.gpa, t);
+        }
+        self.pos += 1;
+    }
+
+    fn dropByteOrderMark(self: *Parser) Error!void {
+        // `lines` is shared and read-only; the line is only read from here on.
+        const lines = @constCast(self.lines);
+        lines[self.pos] = lines[self.pos][byte_order_mark.len..];
     }
 
     fn enter(self: *Parser) Error!void {

@@ -189,6 +189,74 @@ pub fn nonPrintableAt(s: []const u8, i: usize) ?NonPrintable {
     return null;
 }
 
+/// A directive line (YAML 1.2.2, 6.8).
+pub const Directive = union(enum) {
+    yaml,
+    tag: struct { handle: []const u8, prefix: []const u8 },
+    /// A directive the specification reserves; it is ignored.
+    reserved,
+};
+
+/// Reads a whole directive line, which may end in a comment.
+pub fn parseDirective(line: []const u8) error{InvalidDirective}!Directive {
+    if (line.len < 2 or line[0] != '%') return error.InvalidDirective;
+    if (!std.unicode.utf8ValidateSlice(line) or findNonPrintable(line) != null) return error.InvalidDirective;
+    if (isBlankByte(line[1])) return error.InvalidDirective;
+    var it = std.mem.tokenizeAny(u8, line[1..], " \t");
+    const name = it.next() orelse return error.InvalidDirective;
+    var params: [2][]const u8 = undefined;
+    var count: usize = 0;
+    while (it.next()) |word| {
+        if (word[0] == '#') break;
+        if (count < params.len) params[count] = word;
+        count += 1;
+    }
+    if (std.mem.eql(u8, name, "YAML")) {
+        // Any 1.x document is read by the 1.2 rules.
+        if (count != 1) return error.InvalidDirective;
+        const dot = std.mem.indexOfScalar(u8, params[0], '.') orelse return error.InvalidDirective;
+        if (!std.mem.eql(u8, params[0][0..dot], "1")) return error.InvalidDirective;
+        const minor = params[0][dot + 1 ..];
+        if (minor.len == 0) return error.InvalidDirective;
+        for (minor) |c| if (!std.ascii.isDigit(c)) return error.InvalidDirective;
+        return .yaml;
+    }
+    if (std.mem.eql(u8, name, "TAG")) {
+        if (count != 2 or !isTagHandle(params[0])) return error.InvalidDirective;
+        const prefix = params[1];
+        // `!local-prefix`, or a URI that does not start like a flow collection.
+        if (std.mem.findScalar(u8, ",[]{}", prefix[0]) != null or !isUri(prefix)) return error.InvalidDirective;
+        return .{ .tag = .{ .handle = params[0], .prefix = prefix } };
+    }
+    return .reserved;
+}
+
+fn isBlankByte(c: u8) bool {
+    return c == ' ' or c == '\t';
+}
+
+/// `!`, `!!` or `!name!`.
+pub fn isTagHandle(h: []const u8) bool {
+    if (h.len == 0 or h[0] != '!') return false;
+    if (h.len == 1) return true;
+    if (h[h.len - 1] != '!') return false;
+    for (h[1 .. h.len - 1]) |c| if (!std.ascii.isAlphanumeric(c) and c != '-') return false;
+    return true;
+}
+
+/// Made of `ns-uri-char`: URI characters, with others as `%XX`.
+pub fn isUri(s: []const u8) bool {
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (c == '%') {
+            if (i + 2 >= s.len or !std.ascii.isHex(s[i + 1]) or !std.ascii.isHex(s[i + 2])) return false;
+            i += 2;
+        } else if (!std.ascii.isAlphanumeric(c) and std.mem.findScalar(u8, "-#;/?:@&=+$,_.!~*'()[]", c) == null) return false;
+    }
+    return true;
+}
+
 /// A comment line must be empty or start with `#` (after blanks, which are
 /// not written: comments take their item's indent); a trailing
 /// comment must start with `#`; both must be valid UTF-8 without line breaks

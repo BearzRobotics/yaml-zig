@@ -14,6 +14,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const parser = @import("parser.zig");
+const writer = @import("writer.zig");
 
 pub const Value = @import("value.zig").Value;
 pub const Scalar = @import("value.zig").Scalar;
@@ -22,7 +24,7 @@ pub const Style = @import("value.zig").Style;
 pub const Seq = @import("value.zig").Seq;
 pub const Map = @import("value.zig").Map;
 pub const Comments = @import("value.zig").Comments;
-pub const ParseError = @import("parser.zig").Error;
+pub const ParseError = parser.Error;
 pub const Options = @import("parser.zig").Options;
 pub const Diagnostic = @import("parser.zig").Diagnostic;
 pub const ParseReaderError = ParseError || error{ReadFailed};
@@ -48,6 +50,11 @@ pub const Document = struct {
     /// How deep collections may nest when written: `Options.max_depth` as
     /// parsed, so that the output can be read with the same options.
     max_depth: u32 = (Options{}).max_depth,
+    /// `%YAML` and `%TAG` lines, as written above the document's `---`.
+    directives: []const []const u8 = &.{},
+    /// The source closed the document with `...`. A stream writes the marker
+    /// again if another document follows.
+    explicit_end: bool = false,
 
     /// An empty document whose root is an empty mapping.
     pub fn init(gpa: Allocator) Allocator.Error!Document {
@@ -63,7 +70,11 @@ pub const Document = struct {
     pub fn parse(gpa: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) ParseError!Document {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
-        const res = try @import("parser.zig").parse(gpa, arena.allocator(), source, options, diag);
+        const res = try parser.parse(gpa, arena.allocator(), source, options, diag);
+        return fromResult(arena, res, options);
+    }
+
+    fn fromResult(arena: std.heap.ArenaAllocator, res: parser.Result, options: Options) Document {
         return .{
             .arena = arena,
             .root = res.root,
@@ -73,6 +84,8 @@ pub const Document = struct {
             .footer = res.footer,
             .root_comments = res.root_comments,
             .start_comment = res.start_comment,
+            .directives = res.directives,
+            .explicit_end = res.explicit_end,
             .max_depth = options.max_depth,
         };
     }
@@ -233,7 +246,11 @@ pub const Document = struct {
     // ---- writing ---------------------------------------------------------------------
 
     pub fn write(self: *const Document, w: *std.Io.Writer) WriteError!void {
-        try @import("writer.zig").write(w, .{
+        try writer.write(w, self.view());
+    }
+
+    fn view(self: *const Document) writer.Doc {
+        return .{
             .root = self.root,
             .indent = self.indent,
             .explicit_start = self.explicit_start,
@@ -241,20 +258,92 @@ pub const Document = struct {
             .footer = self.footer,
             .root_comments = self.root_comments,
             .start_comment = self.start_comment,
+            .directives = self.directives,
+            .explicit_end = self.explicit_end,
             .max_depth = self.max_depth,
-        });
+        };
     }
 
     /// Returns the YAML text; caller frees with `gpa`.
-    pub fn toOwnedString(self: *const Document, gpa: Allocator) (Allocator.Error || error{ WriteFailed, InvalidUtf8, NestingTooDeep })![]u8 {
-        var aw: std.Io.Writer.Allocating = .init(gpa);
-        errdefer aw.deinit();
-        self.write(&aw.writer) catch |e| switch (e) {
-            // An allocating writer fails only when it cannot grow.
-            error.WriteFailed => return error.OutOfMemory,
-            error.InvalidUtf8, error.NestingTooDeep => |other| return other,
-        };
-        return aw.toOwnedSlice();
+    pub fn toOwnedString(self: *const Document, gpa: Allocator) ToStringError![]u8 {
+        return toString(self, gpa);
+    }
+};
+
+pub const ToStringError = Allocator.Error || error{ WriteFailed, InvalidUtf8, NestingTooDeep, InvalidDirective };
+
+fn toString(value: anytype, gpa: Allocator) ToStringError![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+    value.write(&aw.writer) catch |e| switch (e) {
+        // An allocating writer fails only when it cannot grow.
+        error.WriteFailed => return error.OutOfMemory,
+        error.InvalidUtf8, error.NestingTooDeep, error.InvalidDirective => |other| return other,
+    };
+    return aw.toOwnedSlice();
+}
+
+/// All the documents of a YAML stream. Each has its own arena, so one can be
+/// edited or kept without the others.
+pub const Stream = struct {
+    gpa: Allocator,
+    /// Allocated with `gpa`; `deinit` frees it and every document in it.
+    documents: []Document,
+    /// The comments of a stream that has no document.
+    comments: []const []const u8 = &.{},
+    comment_arena: std.heap.ArenaAllocator,
+
+    /// Parses every document in `source` (UTF-8), which is not retained.
+    /// `options.max_bytes` limits the stream as a whole.
+    pub fn parse(gpa: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) ParseError!Stream {
+        var reader = try parser.Reader.init(gpa, source, options, diag);
+        defer reader.deinit();
+        var documents: std.ArrayList(Document) = .empty;
+        errdefer {
+            for (documents.items) |*d| d.deinit();
+            documents.deinit(gpa);
+        }
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(gpa);
+            errdefer arena.deinit();
+            const res = try reader.next(arena.allocator()) orelse {
+                arena.deinit();
+                break;
+            };
+            try documents.append(gpa, Document.fromResult(arena, res, options));
+        }
+        var comment_arena = std.heap.ArenaAllocator.init(gpa);
+        errdefer comment_arena.deinit();
+        const comments: []const []const u8 = if (documents.items.len == 0) try reader.leftover(comment_arena.allocator()) else &.{};
+        const owned = try documents.toOwnedSlice(gpa);
+        return .{ .gpa = gpa, .documents = owned, .comments = comments, .comment_arena = comment_arena };
+    }
+
+    pub fn deinit(self: *Stream) void {
+        for (self.documents) |*d| d.deinit();
+        self.gpa.free(self.documents);
+        self.comment_arena.deinit();
+        self.* = undefined;
+    }
+
+    /// Writes every document, with the `---` and `...` lines that keep them
+    /// apart.
+    pub fn write(self: *const Stream, w: *std.Io.Writer) WriteError!void {
+        for (self.documents) |*d| try writer.check(d.view());
+        for (self.comments) |line| {
+            try w.writeAll(line);
+            try w.writeByte('\n');
+        }
+        var ended = false;
+        for (self.documents, 0..) |*d, i| {
+            const next: ?writer.Doc = if (i + 1 < self.documents.len) self.documents[i + 1].view() else null;
+            ended = try writer.writeInStream(w, d.view(), i, ended, next);
+        }
+    }
+
+    /// Returns the YAML text; caller frees with `gpa`.
+    pub fn toOwnedString(self: *const Stream, gpa: Allocator) ToStringError![]u8 {
+        return toString(self, gpa);
     }
 };
 

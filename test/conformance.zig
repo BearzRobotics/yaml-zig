@@ -99,63 +99,97 @@ fn runCase(gpa: std.mem.Allocator, a: std.mem.Allocator, io: std.Io, case: std.I
     const source = try case.readFileAlloc(io, "in.yaml", a, .limited(max_file));
     const must_fail = if (case.access(io, "error", .{})) |_| true else |_| false;
 
-    var doc = yaml.Document.parse(gpa, source, .{}, null) catch |e| {
+    var stream = yaml.Stream.parse(gpa, source, .{}, null) catch |e| {
         if (e == error.OutOfMemory) return error.OutOfMemory;
         if (must_fail) return .pass;
         return if (e == error.Unsupported) .unsupported else .rejected_valid;
     };
-    defer doc.deinit();
+    defer stream.deinit();
     if (must_fail) return .accepted_invalid;
 
     const expected = try case.readFileAlloc(io, "test.event", a, .limited(max_file));
-    if (!try sameStructure(a, &doc, expected)) return .wrong_structure;
+    if (!try sameStructure(a, stream.documents, expected)) return .wrong_structure;
 
     const json_text: ?[]const u8 = case.readFileAlloc(io, "in.json", a, .limited(max_file)) catch |e| switch (e) {
         error.FileNotFound => null,
         else => return e,
     };
     if (json_text) |t| {
-        // An empty file means no document. A stream of several documents is
-        // not one JSON value, and must not have been read as one document.
-        if (std.mem.trim(u8, t, " \r\n").len != 0) {
-            const want = std.json.parseFromSliceLeaky(Json, a, t, .{}) catch return .wrong_value;
+        // One JSON value for each document, one after the other.
+        var rest = t;
+        for (stream.documents) |doc| {
+            const one = jsonValue(&rest) orelse return .wrong_value;
+            const want = std.json.parseFromSliceLeaky(Json, a, one, .{}) catch return .wrong_value;
             if (!matches(doc.root, want)) return .wrong_value;
         }
+        if (jsonValue(&rest) != null) return .wrong_value;
     }
 
-    const written = try doc.toOwnedString(a);
-    var again = yaml.Document.parse(gpa, written, .{}, null) catch return .bad_round_trip;
+    const written = try stream.toOwnedString(a);
+    var again = yaml.Stream.parse(gpa, written, .{}, null) catch return .bad_round_trip;
     defer again.deinit();
-    if (!same(doc.root, again.root)) return .bad_round_trip;
+    if (stream.documents.len != again.documents.len) return .bad_round_trip;
+    for (stream.documents, again.documents) |x, y| if (!same(x.root, y.root)) return .bad_round_trip;
     return .pass;
 }
 
-/// Compares `doc` with the suite's event stream. Whether a document's start
-/// and end markers were written is left out: it is not part of the tree.
-fn sameStructure(a: std.mem.Allocator, doc: *const yaml.Document, expected: []const u8) !bool {
+/// Takes the next JSON value off the front of `rest`, or returns null if only
+/// blanks are left.
+fn jsonValue(rest: *[]const u8) ?[]const u8 {
+    const s = std.mem.trimStart(u8, rest.*, " \t\r\n");
+    if (s.len == 0) return null;
+    var depth: usize = 0;
+    var quoted = false;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (quoted) {
+            if (c == '\\') i += 1 else if (c == '"') quoted = false;
+            if (!quoted and depth == 0) {
+                i += 1;
+                break;
+            }
+        } else switch (c) {
+            '"' => quoted = true,
+            '{', '[' => depth += 1,
+            '}', ']' => {
+                depth -= 1;
+                if (depth == 0) {
+                    i += 1;
+                    break;
+                }
+            },
+            ' ', '\t', '\r', '\n' => if (depth == 0) break,
+            else => {},
+        }
+    }
+    const end = @min(i, s.len);
+    rest.* = s[end..];
+    return s[0..end];
+}
+
+/// Compares the documents with the suite's event stream. Whether a document's
+/// start and end markers were written is left out: it is not part of the tree.
+fn sameStructure(a: std.mem.Allocator, documents: []const yaml.Document, expected: []const u8) !bool {
     var want: std.Io.Writer.Allocating = .init(a);
-    var documents: usize = 0;
     var lines = std.mem.tokenizeAny(u8, expected, "\r\n");
     while (lines.next()) |raw| {
         // Leading blanks only show nesting; trailing ones are scalar text.
         var line = std.mem.trimStart(u8, raw, " ");
         if (std.mem.startsWith(u8, line, "+DOC")) {
-            documents += 1;
             line = "+DOC";
         } else if (std.mem.startsWith(u8, line, "-DOC")) line = "-DOC";
         try want.writer.print("{s}\n", .{line});
     }
-    if (documents > 1) return false;
 
     var got: std.Io.Writer.Allocating = .init(a);
     const w = &got.writer;
     try w.writeAll("+STR\n");
-    // A stream without a document reads as an empty one.
-    if (documents != 0) {
+    for (documents) |doc| {
         try w.writeAll("+DOC\n");
         try events(w, doc.root);
         try w.writeAll("-DOC\n");
-    } else if (doc.root != .scalar or doc.root.scalar.text.len != 0) return false;
+    }
     try w.writeAll("-STR\n");
     return std.mem.eql(u8, got.written(), want.written());
 }
