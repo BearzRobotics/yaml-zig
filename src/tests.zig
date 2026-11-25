@@ -704,3 +704,16 @@ test "leading blanks in a comment cannot change the document" {
         try testing.expectEqualStrings("a: |\n  t\n# note\nb: 1\n", out);
     }
 }
+
+test "Map.setComments needs an existing key and does not keep the caller's" {
+    var doc = try parse("a: 1\n");
+    defer doc.deinit();
+    const map = doc.root.map;
+    try testing.expectError(error.NotFound, map.setComments(doc.allocator(), "later", .{ .after = "# orphan" }));
+    var key = [_]u8{'a'};
+    try map.setComments(doc.allocator(), &key, .{ .after = "# c" });
+    key[0] = 'z';
+    try testing.expectEqualStrings("# c", map.commentsOf("a").?.after.?);
+    try map.setComments(doc.allocator(), "a", .{});
+    try testing.expectEqual(@as(?yaml.Comments, null), map.commentsOf("a"));
+}

@@ -291,13 +291,15 @@ pub const Map = struct {
         return self.comments.get(key);
     }
 
-    pub fn setComments(self: *Map, arena: Allocator, key: []const u8, c: Comments) (Allocator.Error || error{InvalidComment})!void {
+    /// Sets or (with empty `c`) removes the comments of an existing key. The
+    /// strings in `c` must be arena-owned.
+    pub fn setComments(self: *Map, arena: Allocator, key: []const u8, c: Comments) (Allocator.Error || error{ InvalidComment, NotFound })!void {
         try checkComments(c);
+        const own_key = self.entries.getKey(key) orelse return error.NotFound;
         if (c.isEmpty()) {
             _ = self.comments.orderedRemove(key);
             return;
         }
-        const k = self.entries.getKey(key) orelse key;
-        try self.comments.put(arena, k, c);
+        try self.comments.put(arena, own_key, c);
     }
 };
