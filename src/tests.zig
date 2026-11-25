@@ -861,7 +861,11 @@ test "diagnostics give the line and column of the error" {
     for ([_]Case{
         .{ .src = "a: \"\\q\"\nb: 1\nc: 2\n", .line = 1, .column = 5 },
         .{ .src = "a: \"x\n  \\q\n  y\"\nb: 1\n", .line = 2, .column = 3 },
-        .{ .src = "a: [1] x\nb: 1\nc: 2\n", .line = 1, .column = 1 },
+        .{ .src = "a: [1] x\nb: 1\nc: 2\n", .line = 1, .column = 8 },
+        // Items that share a line with their dash.
+        .{ .src = "- a: 1\n- - [1] x\n", .line = 2, .column = 9 },
+        .{ .src = "- k: 1\n  k: 2\n", .line = 2, .column = 3 },
+        .{ .src = "- k: 1\n- \"a\": 1\n  'a': 2\n", .line = 3, .column = 3 },
         .{ .src = "a: \"x\" y\nb: 1\n", .line = 1, .column = 8 },
         .{ .src = "a: [1, , 2]\n", .line = 1, .column = 8 },
         .{ .src = "a: b: c\nd: 1\n", .line = 1, .column = 4 },
@@ -1004,4 +1008,11 @@ test "a closing bracket may stand in the parent's column" {
     try rejects("a:\n  os: [\n    x\n  , y]\n", error.Syntax);
     try rejects("a:\n  os: [\n    x\n ]\n", error.Syntax);
     try rejects("a:\n  os: [\n    x\n\t]\n", error.Syntax);
+}
+
+// The old line-classifying parser accepted these as plain keys.
+test "a block key cannot start with a flow indicator" {
+    for ([_][]const u8{ "}x: y\n", "]x: y\n", ",x: y\n", "- }x: y\n", "a: 1\n,b: 2\n" }) |src| {
+        try rejects(src, error.Syntax);
+    }
 }

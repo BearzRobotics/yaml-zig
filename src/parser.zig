@@ -16,8 +16,10 @@
 //! production names (`c-forbidden`, `s-flow-line-prefix`) appear in comments.
 //! ai/SPEC.md lists the one deliberate departure.
 //!
-//! The input is split into lines. Block structure is walked by indentation;
-//! `Flow` moves a cursor over the same lines for `[...]` and `{...}`. Comment
+//! The input is split into lines. Block structure is walked by indentation:
+//! `readNode` reads whatever starts at a position and then says whether a `:`
+//! made it a key (docs/decisions/0001). `Flow` moves a cursor over the same
+//! lines for `[...]` and `{...}`. Comment
 //! and blank lines collect in `pending` and become the `before` of the next
 //! item; a comment after a value on its line is left in `trailing`, and
 //! becomes the item's `after`. Every path that reads a value must take it.
@@ -120,7 +122,7 @@ const Cur = struct {
 const Parser = struct {
     a: Allocator,
     gpa: Allocator,
-    lines: [][]const u8,
+    lines: []const []const u8,
     pos: usize = 0,
     options: Options,
     diag: ?*Diagnostic,
@@ -219,11 +221,10 @@ const Parser = struct {
     }
 
     /// Takes the document's indentation step from the first block collection
-    /// nested under an item at `indent`. A scalar on its own line says
-    /// nothing: it is written back on the item's line.
-    fn learnStep(self: *Parser, child: Cur, indent: usize) Error!void {
-        if (self.step != 0 or child.indent - indent > 8 or child.tabbed) return;
-        if (isSeqEntry(child.content) or try self.splitKey(child.content) != null) self.step = @intCast(child.indent - indent);
+    /// found on a line below the item it is nested in.
+    fn learnStep(self: *Parser, indent: usize, under: ?usize) void {
+        const parent = under orelse return;
+        if (self.step == 0 and indent > parent and indent - parent <= 8) self.step = @intCast(indent - parent);
     }
 
     /// A scalar or a flow collection: a value with no items that could carry
@@ -279,15 +280,17 @@ const Parser = struct {
             } else if (c.indent == 0 and c.content[0] == '%') return self.unsupported("directives are not supported");
         }
         if (inline_root) |rest| {
-            const content = std.mem.trimEnd(u8, splitComment(rest).content, " \t");
-            if (isSeqEntry(content) or try self.splitKey(content) != null)
-                return self.err("a block collection cannot start on the '---' line");
-            res.root = try self.scalarAt(rest, -1);
+            const on_marker_line = "a block collection cannot start on the '---' line";
+            if (isSeqEntry(rest)) return self.err(on_marker_line);
+            res.root = switch (try self.readNode(rest, -1, true)) {
+                .value => |v| v,
+                .key => return self.err(on_marker_line),
+            };
             res.root_comments = .{ .after = self.takeTrailing() };
         } else {
             try self.skipBlank();
             const present = if (try self.cur()) |c| !isDocMarker(c) else false;
-            res.root = try self.block(-1);
+            res.root = try self.block(-1, null);
             if (present and isOneNode(res.root)) {
                 res.root_comments.before = try self.takeBefore();
                 res.root_comments.after = self.takeTrailing();
@@ -319,6 +322,17 @@ const Parser = struct {
         self.depth += 1;
     }
 
+    /// `enter` for a collection that starts at `suffix`.
+    fn enterAt(self: *Parser, suffix: []const u8) Error!void {
+        if (self.depth >= self.options.max_depth) return self.failHere(suffix, "nesting too deep", error.LimitExceeded);
+        self.depth += 1;
+    }
+
+    /// Reports `e` at the start of `suffix`, the end of the current line.
+    fn failHere(self: *Parser, suffix: []const u8, msg: []const u8, e: Error) Error {
+        return failAt(self.diag, self.pos + 1, self.columnOf(suffix), msg, e);
+    }
+
     /// Reports `e` on the current line, at its first character after the indent.
     fn fail(self: *Parser, msg: []const u8, e: Error) Error {
         const index = @min(self.pos, self.lines.len -| 1);
@@ -326,85 +340,162 @@ const Parser = struct {
         return failAt(self.diag, index + 1, column, msg, e);
     }
 
-    /// A node nested deeper than `parent` (an indent, or -1 at the top).
-    fn block(self: *Parser, parent: i64) Error!Value {
+    // ---- block structure -------------------------------------------------------------
+    //
+    // `readNode` reads whatever starts at a position and says whether a `:` made
+    // it a key. The collections are told the column their entries stand in, so
+    // one that starts after `- ` is read where it is.
+
+    /// A node on the lines below, indented more than `parent` (an indent, or -1
+    /// at the top). `under` is the indent of the item it is nested in, if its
+    /// indentation says something about the document's step.
+    fn block(self: *Parser, parent: i64, under: ?usize) Error!Value {
         try self.skipBlank();
         const c = (try self.cur()) orelse return null_scalar;
         if (@as(i64, @intCast(c.indent)) <= parent) return null_scalar;
         if (isDocMarker(c)) return null_scalar;
-        if (c.tabbed) {
-            if (isSeqEntry(c.content) or try self.splitKey(c.content) != null) return self.err("a tab cannot indent a line");
-            return self.scalarAt(self.lines[self.pos][c.indent..], parent);
-        }
-        const is_seq = isSeqEntry(c.content);
-        if (is_seq or try self.splitKey(c.content) != null) {
-            try self.enter();
-            defer self.depth -= 1;
-            return if (is_seq) self.sequence(c.indent) else self.mapping(c.indent);
-        }
-        return self.scalarAt(self.lines[self.pos][c.indent..], parent);
+        const rest = std.mem.trimStart(u8, self.lines[self.pos][c.indent..], " \t");
+        return self.collectionOrNode(rest, parent, c.indent, c.tabbed, under, "a tab cannot indent a line");
     }
 
-    // ---- sequences -----------------------------------------------------------------
-
-    /// `---` or `...` at the start of a line ends or starts a document.
-    fn isDocMarker(c: Cur) bool {
-        return c.indent == 0 and !c.tabbed and isForbidden(c.content);
+    /// What starts at `rest`, in column `column` of the current line, where a
+    /// block collection may start. One cannot if tabs lead up to it.
+    fn collectionOrNode(self: *Parser, rest: []const u8, parent: i64, column: usize, tabbed: bool, under: ?usize, tab_message: []const u8) Error!Value {
+        if (isSeqEntry(rest)) {
+            if (tabbed) return self.err(tab_message);
+            try self.enterAt(rest);
+            defer self.depth -= 1;
+            self.learnStep(column, under);
+            return self.sequence(column);
+        }
+        switch (try self.readNode(rest, parent, true)) {
+            .value => |v| return v,
+            .key => |key| {
+                if (tabbed) return self.err(tab_message);
+                // The key may have moved `pos` no further: it is on one line.
+                try self.enterAt(rest);
+                defer self.depth -= 1;
+                self.learnStep(column, under);
+                return self.mapping(column, key);
+            },
+        }
     }
 
     fn isSeqEntry(content: []const u8) bool {
         return content.len != 0 and content[0] == '-' and (content.len == 1 or isWhite(content[1]));
     }
 
+    /// `---` or `...` at the start of a line ends or starts a document.
+    fn isDocMarker(c: Cur) bool {
+        return c.indent == 0 and !c.tabbed and isForbidden(c.content);
+    }
+
+    /// A `:` that ends a key: followed by a blank or the end of the line.
+    fn isValueIndicator(s: []const u8, i: usize) bool {
+        return i < s.len and s[i] == ':' and (i + 1 == s.len or isWhite(s[i + 1]));
+    }
+
+    const Key = struct {
+        /// The column the key starts in, for diagnostics.
+        column: usize,
+        text: []const u8,
+        style: model.Style,
+        /// What follows the `:` on its line.
+        rest: []const u8,
+    };
+
+    const Node = union(enum) { key: Key, value: Value };
+
+    /// Reads the node that starts `rest`, a suffix of the current line. With
+    /// `keys`, a node followed by `:` on the line it starts on is a key, and
+    /// only that much is consumed. Otherwise the whole value is consumed, with
+    /// the lines it spans, and `trailing` is set.
+    fn readNode(self: *Parser, rest_in: []const u8, parent: i64, keys: bool) Error!Node {
+        const rest = std.mem.trimStart(u8, rest_in, " \t");
+        switch (rest[0]) {
+            '&', '*', '!' => return self.failHere(rest, "anchors, aliases and tags are not supported", error.Unsupported),
+            '@', '`' => return self.errAt(rest, "a reserved indicator cannot start a scalar"),
+            '%' => return self.errAt(rest, "a '%' cannot start a plain scalar"),
+            '"', '\'' => {
+                const first_line = self.pos;
+                const g = try self.gatherQuoted(rest, parent);
+                if (keys and self.pos == first_line) {
+                    const after = std.mem.trimStart(u8, g.tail, " \t");
+                    if (isValueIndicator(after, 0)) return .{ .key = .{
+                        .column = self.columnOf(rest),
+                        .text = try self.decodeQuoted(g.quoted),
+                        .style = if (rest[0] == '"') .double else .single,
+                        .rest = after[1..],
+                    } };
+                }
+                return .{ .value = try self.quotedValue(g) };
+            },
+            '|', '>' => return .{ .value = try self.blockScalar(rest, parent) },
+            '[', '{' => return .{ .value = try self.flowValue(rest, parent) },
+            ',', ']', '}', '#' => return self.errAt(rest, "this indicator cannot start a plain scalar"),
+            '-', '?' => if (rest.len == 1 or isWhite(rest[1])) {
+                if (keys and rest[0] == '?') return self.failHere(rest, "complex keys are not supported", error.Unsupported);
+                return self.errAt(rest, "this indicator cannot start a plain scalar here");
+            },
+            ':' => if (!keys and (rest.len == 1 or isWhite(rest[1])))
+                return self.errAt(rest, "this indicator cannot start a plain scalar here"),
+            else => {},
+        }
+        if (keys) {
+            const content = splitPlain(rest).content;
+            var i: usize = 0;
+            while (i < content.len) : (i += 1) {
+                if (!isValueIndicator(content, i)) continue;
+                // The key may be empty (`: value`).
+                const text = std.mem.trimEnd(u8, content[0..i], " \t");
+                try self.checkPrintable(text);
+                return .{ .key = .{ .column = self.columnOf(rest), .text = try self.a.dupe(u8, text), .style = .plain, .rest = rest[i + 1 ..] } };
+            }
+        }
+        return .{ .value = try self.plainScalar(rest, parent) };
+    }
+
+    // ---- sequences -----------------------------------------------------------------
+
+    /// The sequence whose first `-` is in column `indent` of the current line.
     fn sequence(self: *Parser, indent: usize) Error!Value {
         const seq = try self.a.create(Seq);
         seq.* = .{};
-        while (true) {
-            try self.skipBlank();
-            const c = (try self.cur()) orelse break;
-            if (c.indent < indent or isDocMarker(c)) break;
-            if (c.tabbed) return self.err("a tab cannot indent a line");
-            if (c.indent > indent) return self.err("bad indentation of a sequence entry");
-            if (!isSeqEntry(c.content)) break;
+        var first = true;
+        while (true) : (first = false) {
+            if (!first) {
+                try self.skipBlank();
+                const c = (try self.cur()) orelse break;
+                if (c.indent < indent or isDocMarker(c)) break;
+                if (c.tabbed) return self.err("a tab cannot indent a line");
+                if (c.indent > indent) return self.err("bad indentation of a sequence entry");
+                if (!isSeqEntry(c.content)) break;
+            }
             var before = try self.takeBefore();
             const raw = self.lines[self.pos];
             var j = indent + 1;
             while (j < raw.len and isWhite(raw[j])) j += 1;
             const rest = raw[j..];
-            const tab_separated = std.mem.indexOfScalar(u8, raw[indent..j], '\t') != null;
             var item: Value = undefined;
             var after: ?[]const u8 = null;
-            const sc = splitComment(rest);
-            if (std.mem.trim(u8, sc.content, " \t").len == 0) {
-                after = if (sc.comment) |t| try self.keepComment(t) else null;
+            if (rest.len == 0 or rest[0] == '#') {
+                after = if (rest.len != 0) try self.keepComment(std.mem.trimEnd(u8, rest, " \t")) else null;
                 self.pos += 1;
                 try self.skipBlank();
                 const next = try self.cur();
                 const present = next != null and next.?.indent > indent;
-                if (present) try self.learnStep(next.?, indent);
-                item = try self.block(@intCast(indent));
+                item = try self.block(@intCast(indent), indent);
                 // After a null item, pending comments belong to what follows.
                 if (present) {
                     const found = try self.commentsAround(item, before, after);
                     before = found.before;
                     after = found.after;
                 }
-            } else if (tab_separated) {
-                // A collection that starts on the dash's line is indented by
-                // the blanks before it, so those must be spaces.
-                const content = std.mem.trimEnd(u8, sc.content, " \t");
-                if (isSeqEntry(content) or try self.splitKey(content) != null)
-                    return self.err("a tab cannot indent a collection");
-                item = try self.scalarAt(rest, @intCast(indent));
-                after = self.takeTrailing();
             } else {
-                // The entry's content starts on the dash's line: parse it as a
-                // line of its own, indented to where it starts.
-                const synth = try self.a.alloc(u8, j + rest.len);
-                @memset(synth[0..j], ' ');
-                @memcpy(synth[j..], rest);
-                self.lines[self.pos] = synth;
-                item = try self.block(@intCast(indent));
+                // The blanks before a collection on the dash's line indent it,
+                // so they must be spaces.
+                const tabbed = std.mem.indexOfScalar(u8, raw[indent..j], '\t') != null;
+                item = try self.collectionOrNode(rest, @intCast(indent), j, tabbed, null, "a tab cannot indent a collection");
                 after = self.takeTrailing();
             }
             try seq.items.append(self.a, item);
@@ -415,115 +506,68 @@ const Parser = struct {
 
     // ---- mappings --------------------------------------------------------------------
 
-    const KeyInfo = struct { key: []const u8, style: model.Style, rest: usize };
-
-    /// If `content` (a line without its indent or comment) starts `key:`, the
-    /// decoded key and the offset just after the colon.
-    fn splitKey(self: *Parser, content: []const u8) Error!?KeyInfo {
-        if (content.len == 0) return null;
-        const c0 = content[0];
-        switch (c0) {
-            // Not simple keys: `scalarAt` deals with them.
-            '[', '{', '|', '>' => return null,
-            // A line that starts like this is refused whether or not it has a key.
-            '&', '*', '!' => return self.unsupported("anchors, aliases and tags are not supported"),
-            '@', '`' => return self.err("a reserved indicator cannot start a scalar"),
-            '%' => return self.err("a '%' cannot start a plain scalar"),
-            '?' => if (content.len == 1 or isWhite(content[1])) return self.unsupported("complex keys are not supported"),
-            else => {},
+    /// The key that starts the line at column `indent`.
+    fn nextKey(self: *Parser, indent: usize) Error!Key {
+        const first_line = self.pos;
+        switch (try self.readNode(self.lines[self.pos][indent..], @intCast(indent), true)) {
+            .key => |key| return key,
+            .value => {
+                self.pos = first_line;
+                return self.err("expected 'key:'");
+            },
         }
-        if (c0 == '"' or c0 == '\'') {
-            const end = scanQuoted(content) orelse return null;
-            var k = end;
-            while (k < content.len and isWhite(content[k])) k += 1;
-            if (k < content.len and content[k] == ':' and (k + 1 == content.len or isWhite(content[k + 1]))) {
-                self.quote_column = indentOf(self.lines[self.pos]) + 1;
-                return .{ .key = try self.decodeQuoted(content[0..end]), .style = if (c0 == '"') .double else .single, .rest = k + 1 };
-            }
-            return null;
-        }
-        var i: usize = 0;
-        while (i < content.len) : (i += 1) {
-            if (content[i] == ':' and (i + 1 == content.len or isWhite(content[i + 1]))) {
-                // The key may be empty (`: value`).
-                const key = std.mem.trimEnd(u8, content[0..i], " \t");
-                try self.checkPrintable(key);
-                return .{ .key = try self.a.dupe(u8, key), .style = .plain, .rest = i + 1 };
-            }
-        }
-        return null;
     }
 
-    fn mapping(self: *Parser, indent: usize) Error!Value {
+    /// The mapping whose keys are in column `indent`. The first one has been read.
+    fn mapping(self: *Parser, indent: usize, first_key: Key) Error!Value {
         const map = try self.a.create(Map);
         map.* = .{};
+        var key = first_key;
         while (true) {
-            try self.skipBlank();
-            const c = (try self.cur()) orelse break;
-            if (c.indent < indent or isDocMarker(c)) break;
-            if (c.tabbed) return self.err("a tab cannot indent a line");
-            if (c.indent > indent) return self.err("bad indentation of a mapping entry");
-            if (isSeqEntry(c.content)) break;
-            const ki = (try self.splitKey(c.content)) orelse return self.err("expected 'key:'");
-            if (map.entries.contains(ki.key)) return self.err("duplicate key");
+            if (map.entries.contains(key.text)) return failAt(self.diag, self.pos + 1, key.column, "duplicate key", error.Syntax);
             var before = try self.takeBefore();
-            const raw = self.lines[self.pos][indent..];
-            const rest = std.mem.trimStart(u8, raw[ki.rest..], " \t");
-            const sc = splitComment(rest);
+            const rest = std.mem.trimStart(u8, key.rest, " \t");
             var v: Value = undefined;
             var after: ?[]const u8 = null;
-            if (std.mem.trim(u8, sc.content, " \t").len == 0) {
-                after = if (sc.comment) |t| try self.keepComment(t) else null;
+            if (rest.len == 0 or rest[0] == '#') {
+                after = if (rest.len != 0) try self.keepComment(std.mem.trimEnd(u8, rest, " \t")) else null;
                 self.pos += 1;
                 try self.skipBlank();
                 const next = try self.cur();
-                if (next != null and next.?.indent > indent) {
-                    try self.learnStep(next.?, indent);
-                    v = try self.block(@intCast(indent));
+                const deeper = next != null and next.?.indent > indent;
+                if (deeper) {
+                    v = try self.block(@intCast(indent), indent);
                 } else if (next != null and next.?.indent == indent and !next.?.tabbed and isSeqEntry(next.?.content)) {
                     try self.enter();
                     defer self.depth -= 1;
                     v = try self.sequence(indent);
                 } else v = null_scalar;
                 // After a null value, pending comments belong to what follows.
-                if (v != .scalar or next != null and next.?.indent > indent) {
+                if (v != .scalar or deeper) {
                     const found = try self.commentsAround(v, before, after);
                     before = found.before;
                     after = found.after;
                 }
             } else {
-                v = try self.scalarAt(rest, @intCast(indent));
+                v = (try self.readNode(rest, @intCast(indent), false)).value;
                 after = self.takeTrailing();
             }
-            try map.entries.put(self.a, ki.key, v);
-            try map.noteKeyStyle(self.a, ki.key, ki.style);
-            if (before.len != 0 or after != null) try map.comments.put(self.a, ki.key, .{ .before = before, .after = after });
+            try map.entries.put(self.a, key.text, v);
+            try map.noteKeyStyle(self.a, key.text, key.style);
+            if (before.len != 0 or after != null) try map.comments.put(self.a, key.text, .{ .before = before, .after = after });
+
+            try self.skipBlank();
+            const c = (try self.cur()) orelse break;
+            if (c.indent < indent or isDocMarker(c)) break;
+            if (c.tabbed) return self.err("a tab cannot indent a line");
+            if (c.indent > indent) return self.err("bad indentation of a mapping entry");
+            if (isSeqEntry(c.content)) break;
+            key = try self.nextKey(indent);
         }
         return .{ .map = map };
     }
 
     // ---- scalars and flow collections ---------------------------------------------------
-
-    /// The value whose text is `rest` (it may end in a comment) on line `pos`.
-    /// Consumes the lines it spans, sets `trailing`.
-    fn scalarAt(self: *Parser, rest_in: []const u8, parent: i64) Error!Value {
-        const rest = std.mem.trimStart(u8, rest_in, " \t");
-        const c = rest[0];
-        switch (c) {
-            '&', '*', '!' => return self.unsupported("anchors, aliases and tags are not supported"),
-            '@', '`' => return self.errAt(rest, "a reserved indicator cannot start a scalar"),
-            '%' => return self.errAt(rest, "a '%' cannot start a plain scalar"),
-            '"', '\'' => return self.quotedScalar(rest, parent),
-            '|', '>' => return self.blockScalar(rest, parent),
-            '[', '{' => return self.flowValue(rest, parent),
-            ',', ']', '}', '#' => return self.errAt(rest, "this indicator cannot start a plain scalar"),
-            '-', '?', ':' => {
-                if (rest.len == 1 or isWhite(rest[1])) return self.errAt(rest, "this indicator cannot start a plain scalar here");
-                return self.plainScalar(rest, parent);
-            },
-            else => return self.plainScalar(rest, parent),
-        }
-    }
 
     const Gathered = struct {
         /// The quoted scalar, quotes included, line breaks as `\n`.
@@ -560,8 +604,8 @@ const Parser = struct {
         };
     }
 
-    fn quotedScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
-        const g = try self.gatherQuoted(first, parent);
+    /// The value of the quoted scalar `g`, whose last line is the current one.
+    fn quotedValue(self: *Parser, g: Gathered) Error!Value {
         const tail = splitPlain(g.tail);
         if (g.tail.len != 0 and g.tail[0] == '#') return self.errAt(g.tail, "a comment needs a blank before '#'");
         if (std.mem.trim(u8, tail.content, " \t").len != 0) return self.errAt(std.mem.trimStart(u8, g.tail, " \t"), "unexpected text after a quoted scalar");
@@ -746,8 +790,8 @@ const Parser = struct {
         // moved there rather than lost.
         self.trailing = flow.last_comment;
         if (rest.len != 0) {
-            if (rest[0] == ':') return self.unsupported("a collection as a key is not supported");
-            if (rest[0] != '#' or rest.len == tail.len) return self.err("unexpected text after a flow collection");
+            if (rest[0] == ':') return self.failHere(rest, "a collection as a key is not supported", error.Unsupported);
+            if (rest[0] != '#' or rest.len == tail.len) return self.errAt(rest, "unexpected text after a flow collection");
             self.trailing = try self.keepComment(std.mem.trimEnd(u8, rest, " \t"));
         }
         self.pos += 1;
@@ -1120,10 +1164,8 @@ fn splitPlain(s: []const u8) CommentSplit {
     return .{ .content = s, .comment = null };
 }
 
-/// `splitPlain` for text that may start with a quoted scalar or key, in which a
-/// `#` is text. A quote anywhere else is an ordinary character (`don't`). A
-/// quoted value later on the line (`key: "a # b"`) is cut short here, which is
-/// harmless: it is read again from its own first character.
+/// `splitPlain` for a whole line, which may start with a quoted scalar in which
+/// a `#` is text. It is only used to see what a line starts with.
 fn splitComment(s: []const u8) CommentSplit {
     const start = s.len - std.mem.trimStart(u8, s, " \t").len;
     if (start == s.len or (s[start] != '"' and s[start] != '\'')) return splitPlain(s);
