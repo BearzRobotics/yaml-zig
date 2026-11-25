@@ -421,7 +421,8 @@ const Parser = struct {
 
     fn quotedScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
         const g = try self.gatherQuoted(first, parent);
-        const tail = splitComment(g.tail);
+        const tail = splitPlain(g.tail);
+        if (g.tail.len != 0 and g.tail[0] == '#') return self.err("a comment needs a blank before '#'");
         if (std.mem.trim(u8, tail.content, " \t").len != 0) return self.err("unexpected text after a quoted scalar");
         self.trailing = if (tail.comment) |t| try self.a.dupe(u8, t) else null;
         const s = try self.decodeQuoted(g.quoted);
@@ -439,7 +440,7 @@ const Parser = struct {
     }
 
     fn plainScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
-        const sc = splitComment(first);
+        const sc = splitPlain(first);
         var out: std.ArrayList(u8) = .empty;
         try out.appendSlice(self.a, std.mem.trimEnd(u8, sc.content, " \t"));
         var comment = sc.comment;
@@ -453,7 +454,7 @@ const Parser = struct {
             const l = self.lines[j];
             const ind = indentOf(l);
             if (@as(i64, @intCast(ind)) <= parent or l[ind] == '#' or isForbidden(l)) break;
-            const part = splitComment(l[ind..]);
+            const part = splitPlain(l[ind..]);
             const t = std.mem.trim(u8, part.content, " \t");
             if (std.mem.indexOf(u8, t, ": ") != null or std.mem.endsWith(u8, t, ":") or isSeqEntry(t) or (t.len > 0 and (t[0] == '"' or t[0] == '\'' or t[0] == '[' or t[0] == '{' or t[0] == '|' or t[0] == '>')))
                 return self.err("unexpected content after a plain scalar (bad indentation?)");
@@ -468,7 +469,7 @@ const Parser = struct {
     }
 
     fn blockScalar(self: *Parser, header: []const u8, parent: i64) Error!Value {
-        const sc = splitComment(header);
+        const sc = splitPlain(header);
         const h = std.mem.trim(u8, sc.content, " \t");
         const literal = h[0] == '|';
         var chomp: enum { clip, strip, keep } = .clip;
@@ -855,31 +856,36 @@ const Flow = struct {
 
 const CommentSplit = struct { content: []const u8, comment: ?[]const u8 };
 
-/// Splits a trailing `# comment` off `s`. A `#` starts one only at the start or
-/// after a blank, and not inside a quoted scalar.
-fn splitComment(s: []const u8) CommentSplit {
+/// Splits a trailing `# comment` off text that holds no quoted scalar: a plain
+/// scalar, or what follows a value. A `#` starts a comment only at the start of
+/// `s` or after a blank.
+fn splitPlain(s: []const u8) CommentSplit {
     var i: usize = 0;
     while (i < s.len) : (i += 1) {
-        const c = s[i];
-        if (c == '#' and (i == 0 or s[i - 1] == ' ' or s[i - 1] == '\t')) {
+        if (s[i] == '#' and (i == 0 or s[i - 1] == ' ' or s[i - 1] == '\t')) {
             return .{ .content = s[0..i], .comment = std.mem.trimEnd(u8, s[i..], " \t") };
-        }
-        if ((c == '"' or c == '\'') and quoteStarts(s, i)) {
-            if (scanQuoted(s[i..])) |e| {
-                i += e - 1;
-            } else return .{ .content = s, .comment = null }; // runs on to the next line
         }
     }
     return .{ .content = s, .comment = null };
 }
 
-/// A quote opens a quoted scalar only where a value or key can start.
-fn quoteStarts(s: []const u8, i: usize) bool {
-    if (i == 0) return true;
-    return switch (s[i - 1]) {
-        ' ', '\t', '[', '{', ',', ':' => true,
-        else => false,
-    };
+/// `splitPlain` for text that may start with a quoted scalar or key, in which a
+/// `#` is text. A quote anywhere else is an ordinary character (`don't`). A
+/// quoted value later on the line (`key: "a # b"`) is cut short here, which is
+/// harmless: it is read again from its own first character.
+fn splitComment(s: []const u8) CommentSplit {
+    const start = s.len - std.mem.trimStart(u8, s, " \t").len;
+    if (start == s.len or (s[start] != '"' and s[start] != '\'')) return splitPlain(s);
+    const end = start + (scanQuoted(s[start..]) orelse return .{ .content = s, .comment = null });
+    // A comment needs a blank before it, so the closing quote cannot be followed
+    // by one directly.
+    var i = end + 1;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '#' and (s[i - 1] == ' ' or s[i - 1] == '\t')) {
+            return .{ .content = s[0..i], .comment = std.mem.trimEnd(u8, s[i..], " \t") };
+        }
+    }
+    return .{ .content = s, .comment = null };
 }
 
 /// `---` or `...` at the very start of a line, followed by a blank or nothing

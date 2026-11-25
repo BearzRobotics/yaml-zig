@@ -408,3 +408,17 @@ test "empty keys, and tabs around the colon" {
     try testing.expectEqualStrings("e", m.getString("d").?);
     try testing.expectEqualStrings("g", m.getString("f").?);
 }
+
+test "a quote inside a plain scalar does not hide a comment" {
+    try expectWritten("a: rock 'n roll # note\n", "a: rock 'n roll # note\n");
+    try expectString("a: rock 'n roll # note\n", "rock 'n roll");
+    try expectString("a: x 'y # z' # c\n", "x 'y");
+    try expectString("a: 5\" pipe # c\n", "5\" pipe");
+    try expectString("a: \"# not a comment\" # c\n", "# not a comment");
+    try expectString("\"a\": '# kept'\n", "# kept");
+    var doc = try parse("- 'k # 1': v # c\n- it's: x # y\n");
+    defer doc.deinit();
+    try testing.expectEqualStrings("v", doc.root.seq.items.items[0].map.getString("k # 1").?);
+    try testing.expectEqualStrings("x", doc.root.seq.items.items[1].map.getString("it's").?);
+    try rejects("a: \"value\"# c\n", error.Syntax);
+}
