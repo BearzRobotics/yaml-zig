@@ -40,6 +40,9 @@ pub const Document = struct {
     /// Comment lines above a leading `---`, and after the last item (same form as `Comments.before`).
     header: []const []const u8 = &.{},
     footer: []const []const u8 = &.{},
+    /// Comments on a root that is a scalar or a flow collection: the lines
+    /// above it and the comment on its line.
+    root_comments: Comments = .{},
 
     /// An empty document whose root is an empty mapping.
     pub fn init(gpa: Allocator) Allocator.Error!Document {
@@ -63,6 +66,7 @@ pub const Document = struct {
             .explicit_start = res.explicit_start,
             .header = res.header,
             .footer = res.footer,
+            .root_comments = res.root_comments,
         };
     }
 
@@ -222,6 +226,7 @@ pub const Document = struct {
             .explicit_start = self.explicit_start,
             .header = self.header,
             .footer = self.footer,
+            .root_comments = self.root_comments,
         });
     }
 

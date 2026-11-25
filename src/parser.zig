@@ -61,6 +61,9 @@ pub const Result = struct {
     explicit_start: bool,
     header: []const []const u8,
     footer: []const []const u8,
+    /// Comments on a root that is a scalar or a flow collection. (Those of a
+    /// block collection belong to its items.)
+    root_comments: Comments = .{},
 };
 
 const null_scalar: Value = .{ .scalar = .{ .text = "", .style = .plain, .kind = .null } };
@@ -191,6 +194,34 @@ const Parser = struct {
         return self.a.dupe([]const u8, self.pending.items);
     }
 
+    /// A scalar or a flow collection: a value with no items that could carry
+    /// comments of their own.
+    fn isOneNode(v: Value) bool {
+        return switch (v) {
+            .scalar => true,
+            .seq => |q| q.flow,
+            .map => |m| m.flow,
+        };
+    }
+
+    /// The comments of an item whose value starts below its `key:` or `-` line.
+    /// `before` and `line_comment` were found above and on that line. If the
+    /// value is one node, comments between the line and the value, and after
+    /// the value, have no other owner than this item.
+    fn commentsAround(self: *Parser, v: Value, before: []const []const u8, line_comment: ?[]const u8) Error!Comments {
+        if (!isOneNode(v)) return .{ .before = before, .after = line_comment };
+        const between = try self.takeBefore();
+        const value_comment = self.takeTrailing();
+        var lines: std.ArrayList([]const u8) = .empty;
+        try lines.appendSlice(self.a, before);
+        // There is room for one comment on the line that will be written.
+        if (value_comment != null) {
+            if (line_comment) |c| try lines.append(self.a, c);
+        }
+        for (between) |l| if (l.len != 0) try lines.append(self.a, l);
+        return .{ .before = lines.items, .after = value_comment orelse line_comment };
+    }
+
     fn takeTrailing(self: *Parser) ?[]const u8 {
         defer self.trailing = null;
         return self.trailing;
@@ -217,7 +248,16 @@ const Parser = struct {
             if (isSeqEntry(content) or try self.splitKey(content) != null)
                 return self.err("a block collection cannot start on the '---' line");
             res.root = try self.scalarAt(rest, -1);
-        } else res.root = try self.block(-1);
+            res.root_comments = .{ .after = self.takeTrailing() };
+        } else {
+            try self.skipBlank();
+            const present = if (try self.cur()) |c| !isDocMarker(c) else false;
+            res.root = try self.block(-1);
+            if (present and isOneNode(res.root)) {
+                res.root_comments.before = try self.takeBefore();
+                res.root_comments.after = self.takeTrailing();
+            }
+        }
         try self.skipBlank();
         if (try self.cur()) |c| {
             if (!isDocMarker(c)) return self.err("unexpected content or bad indentation");
@@ -286,7 +326,7 @@ const Parser = struct {
             if (c.tabbed) return self.err("a tab cannot indent a line");
             if (c.indent > indent) return self.err("bad indentation of a sequence entry");
             if (!isSeqEntry(c.content)) break;
-            const before = try self.takeBefore();
+            var before = try self.takeBefore();
             const raw = self.lines[self.pos];
             var j = indent + 1;
             while (j < raw.len and isWhite(raw[j])) j += 1;
@@ -303,6 +343,9 @@ const Parser = struct {
                     if (self.step == 0 and nx.indent > indent and nx.indent - indent <= 8) self.step = @intCast(nx.indent - indent);
                 }
                 item = try self.block(@intCast(indent));
+                const found = try self.commentsAround(item, before, after);
+                before = found.before;
+                after = found.after;
             } else if (tab_separated) {
                 // A collection that starts on the dash's line is indented by
                 // the blanks before it, so those must be spaces.
@@ -379,7 +422,7 @@ const Parser = struct {
             if (isSeqEntry(c.content)) break;
             const ki = (try self.splitKey(c.content)) orelse return self.err("expected 'key:'");
             if (map.entries.contains(ki.key)) return self.err("duplicate key");
-            const before = try self.takeBefore();
+            var before = try self.takeBefore();
             const raw = self.lines[self.pos][indent..];
             const rest = std.mem.trimStart(u8, raw[ki.rest..], " \t");
             const sc = splitComment(rest);
@@ -398,6 +441,12 @@ const Parser = struct {
                     defer self.depth -= 1;
                     v = try self.sequence(indent);
                 } else v = null_scalar;
+                // After a null value, pending comments belong to what follows.
+                if (v != .scalar or next != null and next.?.indent > indent) {
+                    const found = try self.commentsAround(v, before, after);
+                    before = found.before;
+                    after = found.after;
+                }
             } else {
                 v = try self.scalarAt(rest, @intCast(indent));
                 after = self.takeTrailing();

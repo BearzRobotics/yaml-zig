@@ -652,3 +652,29 @@ test "a flow collection turns into a block one rather than lose anything" {
     defer testing.allocator.free(root_out);
     try testing.expectEqualStrings("- 1\n- 2 # two\n", root_out);
 }
+
+/// Parses `src`, requires `want` as output, and requires `want` to be stable.
+fn expectStable(src: []const u8, want: []const u8) !void {
+    try expectWritten(src, want);
+    try roundTrips(want);
+}
+
+test "comments around a value on its own line stay with its item" {
+    try expectStable("a:\n  b # keep me\nc: 1\n", "a: b # keep me\nc: 1\n");
+    try expectStable("a: # key\n  b # value\nc: 1\n", "# key\na: b # value\nc: 1\n");
+    try expectStable("a:\n  # about a\n\n  foo\nb: 1\n", "# about a\na: foo\nb: 1\n");
+    try expectStable("- \n  # about\n  foo\n- x\n", "# about\n- foo\n- x\n");
+    try expectStable("a:\n  [1, 2] # list\nb:\n  | # head\n    text\n", "a: [1, 2] # list\nb: | # head\n  text\n");
+    try expectStable("- k:\n    v # mine\n- x\n", "- k: v # mine\n- x\n");
+    // After an empty value, the comments belong to the next item.
+    try expectStable("a:\n# next\nb: 1\n", "a:\n# next\nb: 1\n");
+}
+
+test "comments on a root scalar or flow collection" {
+    try expectStable("foo # c\n", "foo # c\n");
+    try expectStable("# above\nv\n# end\n", "# above\nv\n# end\n");
+    try expectStable("# above\n[1] # c\n", "# above\n[1] # c\n");
+    try expectStable("# above\n|- # c\n  v\n", "# above\n|- # c\n  v\n");
+    try expectStable("# above\n--- v # c\n", "# above\n---\nv # c\n");
+    try expectStable("# only\n", "null\n# only\n");
+}

@@ -28,6 +28,7 @@ pub const Doc = struct {
     explicit_start: bool,
     header: []const []const u8,
     footer: []const []const u8,
+    root_comments: Comments = .{},
 };
 
 pub fn write(w: *Writer, doc: Doc) Error!void {
@@ -36,13 +37,20 @@ pub fn write(w: *Writer, doc: Doc) Error!void {
     try checkUtf8(doc.root);
     try checkComment(.{ .before = doc.header });
     try checkComment(.{ .before = doc.footer });
+    try checkComment(doc.root_comments);
     var g: Gen = .{ .w = w, .step = @max(doc.indent, 1) };
     try g.lines(doc.header, 0);
     if (doc.explicit_start) try w.writeAll("---\n");
-    if (isInline(doc.root)) try g.rootInline(doc.root) else switch (doc.root) {
-        .map => |m| try g.map(m, 0, false),
-        .seq => |q| try g.seq(q, 0),
-        .scalar => unreachable,
+    try g.lines(doc.root_comments.before, 0);
+    const after = doc.root_comments.after;
+    if (isInline(doc.root)) try g.rootInline(doc.root, after) else {
+        // A block collection has no line of its own for a trailing comment.
+        if (after) |a| try g.lines(&.{a}, 0);
+        switch (doc.root) {
+            .map => |m| try g.map(m, 0, false),
+            .seq => |q| try g.seq(q, 0),
+            .scalar => unreachable,
+        }
     }
     try g.lines(doc.footer, 0);
 }
@@ -126,22 +134,20 @@ const Gen = struct {
         try self.w.writeByte('\n');
     }
 
-    fn rootInline(self: *Gen, v: Value) Error!void {
+    fn rootInline(self: *Gen, v: Value, after: ?[]const u8) Error!void {
         switch (v) {
             .scalar => |s| {
-                if (isBlock(s) and blockOk(s.text)) {
-                    try self.blockScalar(s, 0, null, true);
-                    return;
-                }
-                if (s.kind == .null and s.text.len == 0) return self.w.writeAll("null\n");
-                if (s.style == .plain and looksLikeMarker(s.text)) try self.double(s.text) else try self.scalarInline(s, false);
-                try self.w.writeByte('\n');
+                if (isBlock(s) and blockOk(s.text)) return self.blockScalar(s, 0, after, true);
+                if (s.kind == .null and s.text.len == 0)
+                    try self.w.writeAll("null")
+                else if (s.style == .plain and looksLikeMarker(s.text))
+                    try self.double(s.text)
+                else
+                    try self.scalarInline(s, false);
             },
-            else => {
-                try self.flow(v);
-                try self.w.writeByte('\n');
-            },
+            else => try self.flow(v),
         }
+        try self.tail(after);
     }
 
     // ---- block collections ----------------------------------------------------
