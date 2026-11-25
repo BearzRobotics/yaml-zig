@@ -122,7 +122,11 @@ const Gen = struct {
     }
 
     fn lines(self: *Gen, ls: []const []const u8, indent: usize) Error!void {
-        for (ls) |l| {
+        for (ls) |line| {
+            // The item's indent is the only one written. Leading blanks from
+            // setComments could place the line inside a block scalar above, or
+            // put a tab where an indent belongs.
+            const l = std.mem.trimStart(u8, line, " \t");
             if (l.len == 0 and self.after_keep) continue;
             if (l.len != 0) try self.pad(indent);
             try self.w.writeAll(l);

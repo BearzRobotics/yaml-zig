@@ -170,7 +170,8 @@ pub fn nonPrintableAt(s: []const u8, i: usize) ?NonPrintable {
     return null;
 }
 
-/// A comment line must be empty or start with `#` (after blanks); a trailing
+/// A comment line must be empty or start with `#` (after blanks, which are
+/// not written: comments take their item's indent); a trailing
 /// comment must start with `#`; both must be valid UTF-8 without line breaks
 /// or non-printable characters.
 pub fn checkComments(c: Comments) error{InvalidComment}!void {

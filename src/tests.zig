@@ -693,3 +693,14 @@ test "the comment on the dash of a mapping entry is written" {
 test "comments on the document marker lines survive" {
     try expectStable("--- # c1\na: 1\n... # c2\n# c3\n", "--- # c1\na: 1\n# c2\n# c3\n");
 }
+
+test "leading blanks in a comment cannot change the document" {
+    var doc = try parse("a: |\n  t\nb: 1\n");
+    defer doc.deinit();
+    for ([_][]const u8{ "    # note", "\t# note", " \t # note" }) |comment| {
+        try doc.setComments(&.{"b"}, .{ .before = &.{comment} });
+        const out = try doc.toOwnedString(testing.allocator);
+        defer testing.allocator.free(out);
+        try testing.expectEqualStrings("a: |\n  t\n# note\nb: 1\n", out);
+    }
+}
