@@ -11,8 +11,8 @@
 //! in whichever form the document's directives allow. An alias is written as
 //! an alias.
 //!
-//! The output must read back to the same tree. What cannot (invalid UTF-8,
-//! nesting beyond `max_depth`, a tag or anchor with no written form, an alias
+//! The output must read back to the same tree. What cannot (invalid UTF-8, a
+//! comment field holding something that is not a comment, nesting beyond `max_depth`, a tag or anchor with no written form, an alias
 //! that would stand for another node) is an error, found before anything is
 //! written.
 //!
@@ -33,7 +33,7 @@ const Anchor = model.Anchor;
 const Allocator = std.mem.Allocator;
 
 /// What is wrong with a document that cannot be written.
-pub const CheckError = error{ InvalidUtf8, NestingTooDeep, InvalidDirective, InvalidTag, InvalidAnchor, BrokenAlias, OutOfMemory };
+pub const CheckError = error{ InvalidUtf8, InvalidComment, NestingTooDeep, InvalidDirective, InvalidTag, InvalidAnchor, BrokenAlias, OutOfMemory };
 
 pub const Error = Writer.Error || CheckError;
 
@@ -92,9 +92,12 @@ fn checkText(s: []const u8) error{InvalidUtf8}!void {
     if (!std.unicode.utf8ValidateSlice(s)) return error.InvalidUtf8;
 }
 
-fn checkComment(c: Comments) error{InvalidUtf8}!void {
+/// Comments are copied to the output as they are, and their fields are open to
+/// the caller: anything that is not a comment would be read back as content.
+pub fn checkComment(c: Comments) error{ InvalidUtf8, InvalidComment }!void {
     for (c.before) |l| try checkText(l);
     if (c.after) |a| try checkText(a);
+    try model.checkComments(c);
 }
 
 /// Checks the text of every node, and that the collections nest no deeper

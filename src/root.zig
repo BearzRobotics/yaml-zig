@@ -9,9 +9,10 @@
 //! const text = try doc.toOwnedString(gpa);   // comments are still there
 //! ```
 //!
-//! `Document` holds one document, `Stream` all those of a file. See
-//! `parser.zig` for what is read, `writer.zig` for what is written back, and
-//! ai/SPEC.md for the limits.
+//! `Document` holds one document, `Stream` all those of a file. The manual
+//! pages in docs/manpages/ describe the API (yaml-zig.3) and what is read and
+//! written (yaml-syntax.5); docs/architecture.md describes the code, and
+//! ai/SPEC.md the requirements and limits.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -41,7 +42,9 @@ pub const Document = struct {
     indent: u8 = 2,
     /// The source began with `---`.
     explicit_start: bool = false,
-    /// Comment lines above a leading `---`, and after the last item (same form as `Comments.before`).
+    /// Comment lines above a leading `---`, and after the last item (same form
+    /// as `Comments.before`). `write` refuses a comment field that holds
+    /// anything but comments.
     header: []const []const u8 = &.{},
     footer: []const []const u8 = &.{},
     /// Comments on a root that is a scalar or a flow collection: the lines
@@ -67,8 +70,10 @@ pub const Document = struct {
         return .{ .arena = arena, .root = .{ .map = m } };
     }
 
-    /// Parses `source` (UTF-8). `source` is not retained. On failure the
-    /// optional `diag` receives a 1-based line and a message.
+    /// Parses `source` (UTF-8, UTF-16 or UTF-32), which must hold at most one
+    /// document; more is `error.Unsupported` (see `Stream`). A source with no
+    /// document gives a null root. `source` is not retained. On failure the
+    /// optional `diag` receives a 1-based line and column and a message.
     pub fn parse(gpa: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) ParseError!Document {
         var arena = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
@@ -241,7 +246,7 @@ pub const Document = struct {
     }
 
     /// Attaches comments to the item at `path`: its `key:` line or its `-` line.
-    /// Strings in `c` are copied. Fails with `error.InvalidComment` if a line is
+    /// An empty `c` removes them. Strings in `c` are copied. Fails with `error.InvalidComment` if a line is
     /// not empty or `#...`.
     pub fn setComments(self: *Document, path: []const []const u8, c: Comments) (PathError || error{InvalidComment})!void {
         std.debug.assert(path.len > 0);
@@ -319,8 +324,8 @@ pub const Stream = struct {
     comments: []const []const u8 = &.{},
     comment_arena: std.heap.ArenaAllocator,
 
-    /// Parses every document in `source` (UTF-8), which is not retained.
-    /// `options.max_bytes` limits the stream as a whole.
+    /// Parses every document in `source` (UTF-8, UTF-16 or UTF-32), which is
+    /// not retained. `options.max_bytes` limits the stream as a whole.
     pub fn parse(gpa: Allocator, source: []const u8, options: Options, diag: ?*Diagnostic) ParseError!Stream {
         var reader = try parser.Reader.init(gpa, source, options, diag);
         defer reader.deinit();
@@ -356,6 +361,7 @@ pub const Stream = struct {
     /// apart.
     pub fn write(self: *const Stream, w: *std.Io.Writer) WriteError!void {
         for (self.documents) |*d| try writer.check(d.view());
+        try writer.checkComment(.{ .before = self.comments });
         for (self.comments) |line| {
             try w.writeAll(line);
             try w.writeByte('\n');

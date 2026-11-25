@@ -1694,3 +1694,56 @@ test "a byte order mark may not stand inside a document" {
     defer back.deinit();
     try testing.expectEqualStrings("x\u{feff}\ny\n", back.root.map.getString("a").?);
 }
+
+// Comment fields are public. What is put in them directly is checked when
+// writing, or it would reach the output as YAML.
+test "no comment field can add content to the output" {
+    const before_cases = [_][]const u8{ "admin: true", " admin: true", "# ok\nadmin: true", "# ok\radmin: true", "- x", "---", "...", "%YAML 1.2", "# \x00", "# \u{feff}" };
+    const after_cases = before_cases ++ [_][]const u8{ "", " # needs to start with the mark" };
+    const Field = enum { header, footer, root_before, root_after, start, seq_before, seq_after, map_before, map_after, stream };
+    for (std.enums.values(Field)) |field| {
+        const is_after = switch (field) {
+            .root_after, .start, .seq_after, .map_after => true,
+            else => false,
+        };
+        const cases: []const []const u8 = if (is_after) &after_cases else &before_cases;
+        for (cases) |text| {
+            var stream = try parseStream("--- \nuser: guest\nlist:\n  - a\n");
+            defer stream.deinit();
+            const doc = &stream.documents[0];
+            const lines: []const []const u8 = &.{text};
+            switch (field) {
+                .header => doc.header = lines,
+                .footer => doc.footer = lines,
+                .root_before => doc.root_comments.before = lines,
+                .root_after => doc.root_comments.after = text,
+                .start => doc.start_comment = text,
+                .seq_before => doc.root.map.getSeq("list").?.comments.items[0].before = lines,
+                .seq_after => doc.root.map.getSeq("list").?.comments.items[0].after = text,
+                .map_before => doc.root.map.entries.values()[0].comments.before = lines,
+                .map_after => doc.root.map.entries.values()[0].comments.after = text,
+                .stream => stream.comments = lines,
+            }
+            errdefer std.debug.print("field {t}, text \"{f}\"\n", .{ field, std.zig.fmtString(text) });
+            try testing.expectError(error.InvalidComment, stream.toOwnedString(testing.allocator));
+            if (field != .stream) try testing.expectError(error.InvalidComment, doc.toOwnedString(testing.allocator));
+            // Nothing at all is written.
+            var buffer: [256]u8 = undefined;
+            var w: std.Io.Writer = .fixed(&buffer);
+            try testing.expectError(error.InvalidComment, stream.write(&w));
+            try testing.expectEqual(@as(usize, 0), w.buffered().len);
+        }
+    }
+}
+
+test "comments assigned directly are written" {
+    var doc = try parse("a: 1\n");
+    defer doc.deinit();
+    doc.header = &.{ "# top", "", "\t# indented" };
+    doc.explicit_start = true;
+    doc.start_comment = "#start";
+    doc.footer = &.{"# end\twith a tab"};
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# top\n\n# indented\n--- #start\na: 1\n# end\twith a tab\n", out);
+}
