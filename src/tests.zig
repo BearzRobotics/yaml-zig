@@ -727,3 +727,28 @@ test "output is stable from the first write" {
         try roundTrips(out);
     }
 }
+
+test "what is written respects max_depth, so it can be read again" {
+    var doc = try yaml.Document.init(testing.allocator);
+    defer doc.deinit();
+    const path: [65][]const u8 = @splat("a");
+    try doc.set(path[0..64], doc.boolean(true));
+    var back = try writeAndRead(&doc);
+    back.deinit();
+    var deeper = path;
+    deeper[0] = "b";
+    try doc.set(&deeper, doc.boolean(true));
+    try testing.expectError(error.NestingTooDeep, doc.toOwnedString(testing.allocator));
+
+    var cycle = try yaml.Document.init(testing.allocator);
+    defer cycle.deinit();
+    try cycle.set(&.{"self"}, cycle.root);
+    try testing.expectError(error.NestingTooDeep, cycle.toOwnedString(testing.allocator));
+
+    // A single pair in a flow sequence is a level of its own.
+    const opts: yaml.Options = .{ .max_depth = 2 };
+    var pair = try yaml.Document.parse(testing.allocator, "[k: v]\n", opts, null);
+    pair.deinit();
+    try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, "[[k: v]]\n", opts, null));
+    try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, "[k: [[v]]]\n", opts, null));
+}

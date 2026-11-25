@@ -20,7 +20,7 @@ const Seq = model.Seq;
 const Map = model.Map;
 const Comments = model.Comments;
 
-pub const Error = Writer.Error || error{InvalidUtf8};
+pub const Error = Writer.Error || error{ InvalidUtf8, NestingTooDeep };
 
 pub const Doc = struct {
     root: Value,
@@ -30,12 +30,13 @@ pub const Doc = struct {
     footer: []const []const u8,
     root_comments: Comments = .{},
     start_comment: ?[]const u8 = null,
+    max_depth: u32,
 };
 
 pub fn write(w: *Writer, doc: Doc) Error!void {
     // Values and keys can be built by hand, so the whole tree is checked
     // before anything is written.
-    try checkUtf8(doc.root);
+    try checkTree(doc.root, doc.max_depth);
     try checkComment(.{ .before = doc.header });
     try checkComment(.{ .before = doc.footer });
     try checkComment(doc.root_comments);
@@ -69,17 +70,21 @@ fn checkComment(c: Comments) error{InvalidUtf8}!void {
     if (c.after) |a| try checkText(a);
 }
 
-fn checkUtf8(v: Value) error{InvalidUtf8}!void {
+/// Checks the text of every node, and that the collections nest no deeper
+/// than `levels`. The limit also stops at a collection that contains itself.
+fn checkTree(v: Value, levels: u32) error{ InvalidUtf8, NestingTooDeep }!void {
     switch (v) {
         .scalar => |s| try checkText(s.text),
         .seq => |q| {
-            for (q.items.items) |item| try checkUtf8(item);
+            if (levels == 0) return error.NestingTooDeep;
+            for (q.items.items) |item| try checkTree(item, levels - 1);
             for (q.comments.items) |c| try checkComment(c);
         },
         .map => |m| {
+            if (levels == 0) return error.NestingTooDeep;
             for (m.entries.keys(), m.entries.values()) |k, item| {
                 try checkText(k);
-                try checkUtf8(item);
+                try checkTree(item, levels - 1);
             }
             for (m.comments.values()) |c| try checkComment(c);
         },

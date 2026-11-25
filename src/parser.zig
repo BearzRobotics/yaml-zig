@@ -976,6 +976,9 @@ const Flow = struct {
             }
             const e = try self.entry(false);
             if (e.value) |v| {
+                // The pair is a mapping around its value: one level more than
+                // was counted while the value was read.
+                if (self.p.depth + 1 + levelsIn(v) > self.p.options.max_depth) return self.p.fail("nesting too deep", error.LimitExceeded);
                 const pair = try self.p.a.create(Map);
                 pair.* = .{ .flow = true };
                 try self.put(pair, e.key, v);
@@ -1003,6 +1006,21 @@ const Flow = struct {
         }
     }
 };
+
+/// How many collections are nested in `v`, itself included.
+fn levelsIn(v: Value) usize {
+    var deepest: usize = 0;
+    switch (v) {
+        .scalar => return 0,
+        .seq => |q| for (q.items.items) |item| {
+            deepest = @max(deepest, levelsIn(item));
+        },
+        .map => |m| for (m.entries.values()) |item| {
+            deepest = @max(deepest, levelsIn(item));
+        },
+    }
+    return 1 + deepest;
+}
 
 const CommentSplit = struct { content: []const u8, comment: ?[]const u8 };
 

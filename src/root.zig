@@ -45,6 +45,9 @@ pub const Document = struct {
     root_comments: Comments = .{},
     /// The comment on the `---` line, written only with `explicit_start`.
     start_comment: ?[]const u8 = null,
+    /// How deep collections may nest when written: `Options.max_depth` as
+    /// parsed, so that the output can be read with the same options.
+    max_depth: u32 = (Options{}).max_depth,
 
     /// An empty document whose root is an empty mapping.
     pub fn init(gpa: Allocator) Allocator.Error!Document {
@@ -70,6 +73,7 @@ pub const Document = struct {
             .footer = res.footer,
             .root_comments = res.root_comments,
             .start_comment = res.start_comment,
+            .max_depth = options.max_depth,
         };
     }
 
@@ -231,17 +235,18 @@ pub const Document = struct {
             .footer = self.footer,
             .root_comments = self.root_comments,
             .start_comment = self.start_comment,
+            .max_depth = self.max_depth,
         });
     }
 
     /// Returns the YAML text; caller frees with `gpa`.
-    pub fn toOwnedString(self: *const Document, gpa: Allocator) (Allocator.Error || error{ WriteFailed, InvalidUtf8 })![]u8 {
+    pub fn toOwnedString(self: *const Document, gpa: Allocator) (Allocator.Error || error{ WriteFailed, InvalidUtf8, NestingTooDeep })![]u8 {
         var aw: std.Io.Writer.Allocating = .init(gpa);
         errdefer aw.deinit();
         self.write(&aw.writer) catch |e| switch (e) {
             // An allocating writer fails only when it cannot grow.
             error.WriteFailed => return error.OutOfMemory,
-            error.InvalidUtf8 => return error.InvalidUtf8,
+            error.InvalidUtf8, error.NestingTooDeep => |other| return other,
         };
         return aw.toOwnedSlice();
     }
