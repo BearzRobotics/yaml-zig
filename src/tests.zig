@@ -1507,3 +1507,17 @@ test "collection keys count towards max_depth" {
         try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, src, opts, null));
     }
 }
+
+test "a block scalar cut off by the end of input has no final line break" {
+    for ([_][2][]const u8{
+        .{ "a: |\n  x", "x" },           .{ "a: |+\n  x", "x" },         .{ "a: >\n  x\n  y", "x y" },
+        .{ "a: |\n  x\n", "x\n" },       .{ "a: |+\n  x\n\n", "x\n\n" }, .{ "a: |\r\n  x\r", "x\n" },
+        .{ "a: |\n  x\n   ", "x\n \n" },
+    }) |case| try expectString(case[0], case[1]);
+    // Written back, such a value reads the same.
+    var doc = try parse("a: |\n  x");
+    defer doc.deinit();
+    var back = try writeAndRead(&doc);
+    defer back.deinit();
+    try testing.expectEqualStrings("x", back.root.map.getString("a").?);
+}

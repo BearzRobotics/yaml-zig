@@ -110,8 +110,9 @@ pub const Reader = struct {
             start = end + 1;
             if (end < text.len and text[end] == '\r' and start < text.len and text[start] == '\n') start += 1;
         }
+        const unterminated = text.len != 0 and text[text.len - 1] != '\n' and text[text.len - 1] != '\r';
         return .{
-            .parser = .{ .a = undefined, .gpa = gpa, .lines = lines.items, .options = options, .diag = diag },
+            .parser = .{ .a = undefined, .gpa = gpa, .lines = lines.items, .unterminated = unterminated, .options = options, .diag = diag },
             .lines = lines,
         };
     }
@@ -170,6 +171,8 @@ const Parser = struct {
     a: Allocator,
     gpa: Allocator,
     lines: []const []const u8,
+    /// The source's last line has no line break after it.
+    unterminated: bool = false,
     pos: usize = 0,
     options: Options,
     diag: ?*Diagnostic,
@@ -1224,10 +1227,15 @@ const Parser = struct {
                 started = true;
             }
         }
+        // The input may end right after the last line of text, with no line
+        // break there to keep (`b-chomped-last`). After a line of only spaces
+        // the official test suite does expect one.
+        const cut_off = self.unterminated and body_end == self.lines.len and trailing_blank == 0 and
+            nlines > 0 and !isBlank(self.lines[body_end - 1]);
         if (nlines > 0) switch (chomp) {
             .strip => {},
-            .clip => try out.append(self.a, '\n'),
-            .keep => try out.appendNTimes(self.a, '\n', 1 + trailing_blank),
+            .clip => if (!cut_off) try out.append(self.a, '\n'),
+            .keep => if (!cut_off) try out.appendNTimes(self.a, '\n', 1 + trailing_blank),
         } else if (chomp == .keep) try out.appendNTimes(self.a, '\n', trailing_blank);
         return .{ .scalar = .{ .text = out.items, .style = if (literal) .literal else .folded, .kind = .string } };
     }
