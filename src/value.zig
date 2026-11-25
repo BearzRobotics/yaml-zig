@@ -30,15 +30,29 @@ pub const Scalar = struct {
         return parseInt(self.text);
     }
 
-    /// An integer is accepted as a float too.
+    /// An integer is accepted as a float too, including one too large for
+    /// `asInt` (with the usual loss of precision).
     pub fn asFloat(self: Scalar) ?f64 {
+        const t = self.text;
         switch (self.kind) {
-            .integer => return @floatFromInt(parseInt(self.text) orelse return null),
+            .integer => {
+                if (parseInt(t)) |i| return @floatFromInt(i);
+                // A large hexadecimal or octal number.
+                if (t.len > 2 and t[0] == '0' and (t[1] == 'x' or t[1] == 'o')) {
+                    const base: u8 = if (t[1] == 'x') 16 else 8;
+                    var f: f64 = 0;
+                    for (t[2..]) |c| {
+                        const digit = std.fmt.charToDigit(c, base) catch return null;
+                        f = f * @as(f64, @floatFromInt(base)) + @as(f64, @floatFromInt(digit));
+                    }
+                    return f;
+                }
+                return std.fmt.parseFloat(f64, t) catch null;
+            },
             .float => {
-                const t = self.text;
-                if (std.mem.eql(u8, t, ".inf") or std.mem.eql(u8, t, ".Inf") or std.mem.eql(u8, t, ".INF") or std.mem.eql(u8, t, "+.inf")) return std.math.inf(f64);
-                if (std.mem.eql(u8, t, "-.inf") or std.mem.eql(u8, t, "-.Inf") or std.mem.eql(u8, t, "-.INF")) return -std.math.inf(f64);
-                if (std.mem.eql(u8, t, ".nan") or std.mem.eql(u8, t, ".NaN") or std.mem.eql(u8, t, ".NAN")) return std.math.nan(f64);
+                if (eqAny(t, &positive_infinity)) return std.math.inf(f64);
+                if (eqAny(t, &negative_infinity)) return -std.math.inf(f64);
+                if (eqAny(t, &not_a_number)) return std.math.nan(f64);
                 return std.fmt.parseFloat(f64, t) catch null;
             },
             else => return null,
@@ -49,6 +63,11 @@ pub const Scalar = struct {
         return self.kind == .null;
     }
 };
+
+// The special floats of the core schema.
+const positive_infinity = [_][]const u8{ ".inf", ".Inf", ".INF", "+.inf", "+.Inf", "+.INF" };
+const negative_infinity = [_][]const u8{ "-.inf", "-.Inf", "-.INF" };
+const not_a_number = [_][]const u8{ ".nan", ".NaN", ".NAN" };
 
 fn parseInt(t: []const u8) ?i64 {
     if (t.len > 2 and t[0] == '0' and t[1] == 'x') return std.fmt.parseInt(i64, t[2..], 16) catch null;
@@ -89,7 +108,7 @@ fn isInt(t: []const u8) bool {
 }
 
 fn isFloat(t: []const u8) bool {
-    if (eqAny(t, &.{ ".inf", ".Inf", ".INF", "+.inf", "+.Inf", "+.INF", "-.inf", "-.Inf", "-.INF", ".nan", ".NaN", ".NAN" })) return true;
+    if (eqAny(t, &positive_infinity) or eqAny(t, &negative_infinity) or eqAny(t, &not_a_number)) return true;
     // [-+]? ( \. [0-9]+ | [0-9]+ ( \. [0-9]* )? ) ( [eE] [-+]? [0-9]+ )?
     var i: usize = 0;
     if (i < t.len and (t[i] == '-' or t[i] == '+')) i += 1;

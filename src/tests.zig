@@ -779,3 +779,29 @@ test "diagnostics give the line and column of the error" {
     try testing.expectError(error.LimitExceeded, yaml.Document.parseReader(testing.allocator, &r, .{ .max_bytes = 3 }, &diag));
     try testing.expectEqualStrings("input too large", diag.message);
 }
+
+test "every spelling of the special floats, and large integers" {
+    const inf = std.math.inf(f64);
+    const Case = struct { text: []const u8, want: f64 };
+    for ([_]Case{
+        .{ .text = ".inf", .want = inf },                                   .{ .text = ".Inf", .want = inf },
+        .{ .text = ".INF", .want = inf },                                   .{ .text = "+.inf", .want = inf },
+        .{ .text = "+.Inf", .want = inf },                                  .{ .text = "+.INF", .want = inf },
+        .{ .text = "-.inf", .want = -inf },                                 .{ .text = "-.Inf", .want = -inf },
+        .{ .text = "-.INF", .want = -inf },                                 .{ .text = "0o17", .want = 15 },
+        .{ .text = "+12", .want = 12 },                                     .{ .text = "-1.5e2", .want = -150 },
+        .{ .text = ".5", .want = 0.5 },                                     .{ .text = "99999999999999999999", .want = 1e20 },
+        .{ .text = "0x10000000000000000", .want = 18446744073709551616.0 },
+    }) |case| {
+        const scalar: yaml.Scalar = .{ .text = case.text, .kind = @import("value.zig").resolve(case.text) };
+        try testing.expectEqual(@as(?f64, case.want), scalar.asFloat());
+    }
+    for ([_][]const u8{ ".nan", ".NaN", ".NAN" }) |text| {
+        const scalar: yaml.Scalar = .{ .text = text, .kind = @import("value.zig").resolve(text) };
+        try testing.expect(std.math.isNan(scalar.asFloat().?));
+    }
+    var doc = try parse("a: 0o17\nb: 99999999999999999999\n");
+    defer doc.deinit();
+    try testing.expectEqual(@as(?i64, 15), doc.root.map.getInt("a"));
+    try testing.expectEqual(@as(?i64, null), doc.root.map.getInt("b"));
+}
