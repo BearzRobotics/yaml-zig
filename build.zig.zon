@@ -1,8 +1,8 @@
 .{
     .name = .yaml,
     .fingerprint = 0xea31a9845b1b4d7c,
-    .version = "0.3.0",
+    .version = "0.3.1",
     .minimum_zig_version = "0.17.1",
     .dependencies = .{},
-    .paths = .{ "build.zig", "build.zig.zon", "src", "test", "scripts", "ai", "docs/decisions", "docs/manpages", "LICENSE", "README.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "test", "scripts", "ai", "docs/architecture.md", "docs/decisions", "docs/manpages", "LICENSE", "README.md" },
 }

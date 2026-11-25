@@ -1,5 +1,6 @@
-//! The YAML data model: scalars, sequences and mappings, with the comments
-//! attached to each item.
+//! The YAML data model: scalars, sequences, mappings and aliases, with the
+//! comments attached to each item, and the rules the reader and writer share
+//! (core schema types, tags, directives, equality of keys).
 //!
 //! Ownership: everything reachable from a `Document` lives in its arena.
 
@@ -752,10 +753,15 @@ pub const Map = struct {
     }
 
     /// The value under `key`, following an alias. `entries` has it as written.
+    /// It is the node itself, anchor and all: storing it in a second place
+    /// writes the anchor twice. To refer to it there instead, store
+    /// `.{ .alias = value.anchorOf().? }`.
     pub fn get(self: *const Map, key: []const u8) ?Value {
         return self.entries.values()[self.find(key) orelse return null].value.deref();
     }
 
+    /// Where the value under `key` is stored, as written: it may be an alias.
+    /// The pointer is good until the map next changes.
     pub fn getPtr(self: *Map, key: []const u8) ?*Value {
         return &self.entries.values()[self.find(key) orelse return null].value;
     }

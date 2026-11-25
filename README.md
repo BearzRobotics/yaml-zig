@@ -42,6 +42,11 @@ zig build conformance -Dsuite=conformance-suite
 
 At `data-2022-01-17`, 400 of its 402 cases pass; the other 2 repeat a mapping key and are rejected on purpose. That does not prove full conformance. `ai/SPEC.md` lists the known deviations and limits.
 
+## Changes in 0.3.1
+
+- **Security fix, also affecting earlier releases:** text assigned directly to a comment field (`Document.header`, `footer`, `root_comments`, `start_comment`, `Seq.comments`, a `Map.Entry`'s comments, `Stream.comments`) was written unchecked, so it could add keys and values to the output. `setComments` was not affected. Writing now fails with `error.InvalidComment` unless every such line is a comment. An exhaustive `switch` over write errors needs the new case.
+- Documentation: manual pages for the API ([yaml-zig(3)](docs/manpages/yaml-zig.3.md)) and the format ([yaml-syntax(5)](docs/manpages/yaml-syntax.5.md)), and [docs/architecture.md](docs/architecture.md). Stale API comments corrected.
+
 ## Changes in 0.3.0
 
 Adds what 0.2.0 refused as `error.Unsupported`: several documents, directives, tags, anchors, aliases and complex keys; and UTF-16 and UTF-32 input. `error.Unsupported` now means only a key that holds an alias leading back into it, or, from `Document.parse`, more than one document.

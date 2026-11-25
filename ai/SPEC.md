@@ -1,6 +1,6 @@
 # yaml-zig — Specification
 
-**Status:** 0.3.0, implemented and tested; see "Known deviations and limits".
+**Status:** 0.3.1, implemented and tested; see "Known deviations and limits".
 
 ## Purpose
 
@@ -13,7 +13,7 @@ Read YAML (notably Solus `package.yml`) and write it back without losing comment
 - **YAML-3 (MUST):** Untrusted input: time and memory in proportion to the input. Bounded nesting (`Options.max_depth`, 64 collections, block and flow together), bounded size (`Options.max_bytes`, 16 MiB, which also limits the total length of expanded tag names), at most 64 `%TAG` directives in a document, aliases never expanded, bounded work to compare keys; no undefined behavior or stack overflow on malformed or hostile input; no leaks or swallowed errors on allocation failure (tested).
 - **YAML-4 (MUST):** Report the first error with a 1-based line, a 1-based byte column and a static message (`Diagnostic`). For some errors in a block collection's structure the column is that of the line's first character. For input that was not UTF-8, columns count bytes of its UTF-8 form.
 - **YAML-5 (MUST):** Comments survive parse → edit → write: comment and blank lines before an item, a trailing comment on its line, comments on a root scalar or flow collection, the comment on the `---` line, and comments after the last item of a document or stream. They stay with their item, are dropped with a removed key, and can be set with `Document.setComments`. Where a comment cannot keep its place it moves rather than disappears, except inside flow collections (below).
-- **YAML-6 (MUST):** The written text is UTF-8 of printable characters and parses back, with the same options, to an equal tree: values, kinds, order, tags, anchors and aliases, document by document. What cannot be written that way is an error before anything is written (`InvalidUtf8`, `NestingTooDeep`, `InvalidDirective`, `InvalidTag`, `InvalidAnchor`, `BrokenAlias`). Strings and keys created through the API are quoted when plain text would read as another type or break the syntax.
+- **YAML-6 (MUST):** The written text is UTF-8 of printable characters and parses back, with the same options, to an equal tree: values, kinds, order, tags, anchors and aliases, document by document. A comment field, however it was set, holds only comments. What cannot be written that way is an error before anything is written (`InvalidUtf8`, `InvalidComment`, `NestingTooDeep`, `InvalidDirective`, `InvalidTag`, `InvalidAnchor`, `BrokenAlias`). Strings and keys created through the API are quoted when plain text would read as another type or break the syntax.
 - **YAML-7 (SHOULD):** Plain scalars keep their text (`7.20`, `0x1F`); scalars and keys keep their quotes; tags, anchors and directives are kept; the writer keeps the source's indentation step.
 - **YAML-8 (SHOULD):** No dependencies beyond the Zig standard library. Met.
 
@@ -60,7 +60,10 @@ Writing:
 - A flow collection that comes to hold a block collection or a comment is written in block style.
 - Some valid output, such as an empty key in a flow mapping (`{: v}`), is not read by every YAML library.
 
+- Writing a document twice can change its indentation width, when the only nested block that showed it is moved onto a `-` line. Values are unaffected.
+
 Editing:
 
+- Storing an anchored node in a second place writes its anchor twice: the values read back the same, but the two are no longer one node.
 - A collection used as a key must not be changed while it is in its map, and neither should an anchored node that a key reaches through an alias: key lookups and duplicate checks rely on it.
 - A whole stream is read into memory (the input is split into lines); `parseReader` reads it all first.

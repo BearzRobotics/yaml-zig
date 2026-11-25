@@ -2,6 +2,7 @@
 
 - **Status:** Accepted, 2026-11-25
 - **Applies to:** `src/parser.zig`
+- **Commit:** `a870586`
 
 ## Context
 

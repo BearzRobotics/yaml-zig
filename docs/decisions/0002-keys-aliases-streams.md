@@ -2,6 +2,7 @@
 
 - **Status:** Accepted, 2026-11-25
 - **Applies to:** the data model (`src/value.zig`, `src/root.zig`)
+- **Commits:** `3c7a7f7` (streams), `e57e09e` (keys), `cb0ba57` (aliases), `20f2195` (bounded comparison)
 
 ## Context
 
@@ -23,7 +24,7 @@ anchored value keeps the anchor in that place, so editing through any name
 changes the one node. Writing checks that every alias would read back as the
 node it stands for, and fails otherwise.
 
-Comparing and hashing keys are the only places that go through aliases. An
+Comparing and hashing keys are the only places that recurse through aliases. An
 anchor's hash is computed once, when its node is complete, and one comparison
 has one allowance of work and depth.
 
