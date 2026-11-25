@@ -678,3 +678,14 @@ test "comments on a root scalar or flow collection" {
     try expectStable("# above\n--- v # c\n", "# above\n---\nv # c\n");
     try expectStable("# only\n", "null\n# only\n");
 }
+
+test "the comment on the dash of a mapping entry is written" {
+    try expectStable("- # hello\n  a: 1\n  b: 2\n- x\n", "- # hello\n  a: 1\n  b: 2\n- x\n");
+    try expectStable("k:\n  - # c\n    a:\n      b: 1\n", "k:\n  - # c\n    a:\n      b: 1\n");
+    var doc = try parse("- a: 1\n- b: 2\n");
+    defer doc.deinit();
+    try doc.setComments(&.{"0"}, .{ .before = &.{"# above"}, .after = "# important" });
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("# above\n- # important\n  a: 1\n- b: 2\n", out);
+}

@@ -169,7 +169,9 @@ const Gen = struct {
         for (q.items.items, q.comments.items) |item, c| {
             try self.lines(c.before, indent);
             switch (item) {
-                .map => |m| if (!isInline(item)) {
+                // A comment on the dash's line needs the dash on a line of
+                // its own; the mapping then follows in block form below.
+                .map => |m| if (!isInline(item) and c.after == null) {
                     // Comments above the first key sit above the dash.
                     const first = m.comments.get(m.entries.keys()[0]) orelse Comments{};
                     try self.lines(first.before, indent);
