@@ -9,8 +9,9 @@
 //! const text = try doc.toOwnedString(gpa);   // comments are still there
 //! ```
 //!
-//! See `parser.zig` for the YAML that is read and `writer.zig` for what is
-//! written back.
+//! `Document` holds one document, `Stream` all those of a file. See
+//! `parser.zig` for what is read, `writer.zig` for what is written back, and
+//! ai/SPEC.md for the limits.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

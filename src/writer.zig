@@ -7,12 +7,19 @@
 //! (`7.20`), quoted ones stay quoted, and a flow collection stays flow while
 //! it holds no block collection and no comment.
 //!
+//! Tags, anchors, aliases and directives are written as they were read, tags
+//! in whichever form the document's directives allow. An alias is written as
+//! an alias.
+//!
 //! The output must read back to the same tree. What cannot (invalid UTF-8,
-//! nesting beyond `max_depth`) is an error, found before anything is written.
+//! nesting beyond `max_depth`, a tag or anchor with no written form, an alias
+//! that would stand for another node) is an error, found before anything is
+//! written.
 //!
 //! Not kept: folded scalars (`>`) are written as literal (`|`) with the same
-//! value, a sequence indented like its key moves in by one step, spacing
-//! around `:` is normalized, and `...` is not written.
+//! value, a sequence indented like its key moves in by one step, a `?` entry
+//! with a one-line key becomes `key: value`, spacing around `:` is normalized,
+//! and a document on its own is written without `...`.
 
 const std = @import("std");
 const Writer = std.Io.Writer;

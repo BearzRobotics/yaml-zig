@@ -1,28 +1,16 @@
-//! YAML reader: the block and flow styles of YAML 1.2 that configuration and
-//! recipe files use, with comments kept.
-//!
-//! Supported: block mappings and sequences (any indentation, a sequence may
-//! sit at its key's column), plain / single-quoted / double-quoted scalars
-//! (also over several lines), literal and folded block scalars with chomping
-//! and indentation indicators, flow sequences and mappings, an optional
-//! leading `---` and trailing `...`, and `#` comments. Plain scalars are
-//! typed by the core schema (`Scalar.kind`) but keep their text.
-//!
-//! Not supported, and reported as `error.Unsupported` rather than misread:
-//! anchors, aliases, tags, directives, complex keys (`? `, or a collection as
-//! a key), several documents in one stream.
-//!
-//! The rules follow YAML 1.2.2, https://yaml.org/spec/1.2.2/, whose
-//! production names (`c-forbidden`, `s-flow-line-prefix`) appear in comments.
-//! ai/SPEC.md lists the one deliberate departure.
+//! YAML reader: YAML 1.2.2, https://yaml.org/spec/1.2.2/, with comments kept.
+//! The specification's production names (`c-forbidden`,
+//! `s-flow-line-prefix`) appear in comments here; ai/SPEC.md lists the known
+//! departures from it.
 //!
 //! The input is split into lines. Block structure is walked by indentation:
 //! `readNode` reads whatever starts at a position and then says whether a `:`
 //! made it a key (docs/decisions/0001). `Flow` moves a cursor over the same
-//! lines for `[...]` and `{...}`. Comment
-//! and blank lines collect in `pending` and become the `before` of the next
-//! item; a comment after a value on its line is left in `trailing`, and
-//! becomes the item's `after`. Every path that reads a value must take it.
+//! lines for `[...]` and `{...}`. Comment and blank lines collect in `pending`
+//! and become the `before` of the next item; a comment after a value on its
+//! line is left in `trailing`, and becomes the item's `after`. Every path that
+//! reads a value must take it. Aliases are kept as references and never
+//! expanded (docs/decisions/0002).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -37,10 +25,13 @@ const Anchor = model.Anchor;
 pub const Error = error{
     /// Malformed YAML, or a construct YAML forbids (duplicate key, bad indentation).
     Syntax,
-    /// Valid YAML this library does not read: anchors, aliases, tags, complex keys, several documents.
+    /// Valid YAML that is not read: a key holding an alias that leads back into
+    /// it, or, where one document is wanted, several.
     Unsupported,
+    /// The input is not valid UTF-8, UTF-16 or UTF-32.
     InvalidUtf8,
-    /// Nesting or input size exceeded `Options` limits.
+    /// A limit was exceeded: nesting, input size, tag names, `%TAG` directives,
+    /// or keys too large to compare.
     LimitExceeded,
     OutOfMemory,
 };

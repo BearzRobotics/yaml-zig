@@ -4,18 +4,16 @@
 //!   scripts/fetch-conformance.sh
 //!   zig build conformance -Dsuite=conformance-suite
 //!
-//! yaml-zig reads a documented subset of YAML, so each case lands in one of
-//! these groups:
+//! Each case lands in one of these groups:
 //!
 //!   pass         read with the structure in the case's `test.event` (every
-//!                node's kind, style and text) and the value in its
-//!                `in.json`, and read the same again after being written; or
-//!                an invalid input that is rejected
-//!   unsupported  valid input refused with `error.Unsupported`
-//!   FAIL         anything else: valid input rejected as malformed, a wrong
-//!                value, output that does not read back, or invalid input
-//!                that is accepted
+//!                node's kind, style, text, tag and anchor) and the values in
+//!                its `in.json`, and read the same again after being written;
+//!                or an invalid input that is rejected
 //!   on purpose   one of `rejected_on_purpose`
+//!   FAIL         anything else: valid input refused, as malformed or as
+//!                unsupported; a wrong structure or value; output that does not
+//!                read back; or invalid input that is accepted
 //!
 //! Every failing case is listed, and the step fails if there is one.
 
@@ -89,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn isFailure(o: Outcome) bool {
-    return o != .pass and o != .unsupported and o != .on_purpose;
+    return o != .pass and o != .on_purpose;
 }
 
 fn lessThan(_: void, a: []const u8, b: []const u8) bool {
