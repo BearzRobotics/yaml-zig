@@ -9,12 +9,18 @@
 //! typed by the core schema (`Scalar.kind`) but keep their text.
 //!
 //! Not supported, and reported as `error.Unsupported` rather than misread:
-//! anchors, aliases, tags, directives, complex keys (`? `), several documents
-//! in one stream.
+//! anchors, aliases, tags, directives, complex keys (`? `, or a collection as
+//! a key), several documents in one stream.
 //!
-//! The input is split into lines, which are walked by indentation. Comment
+//! The rules follow YAML 1.2.2, https://yaml.org/spec/1.2.2/, whose
+//! production names (`c-forbidden`, `s-flow-line-prefix`) appear in comments.
+//! ai/SPEC.md lists the one deliberate departure.
+//!
+//! The input is split into lines. Block structure is walked by indentation;
+//! `Flow` moves a cursor over the same lines for `[...]` and `{...}`. Comment
 //! and blank lines collect in `pending` and become the `before` of the next
-//! item; a comment after an item on its line becomes its `after`.
+//! item; a comment after a value on its line is left in `trailing`, and
+//! becomes the item's `after`. Every path that reads a value must take it.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;

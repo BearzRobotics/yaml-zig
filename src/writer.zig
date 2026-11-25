@@ -2,14 +2,17 @@
 //!
 //! The output is block style with the document's indentation step (learned
 //! from the source, 2 by default). Comments are written next to the item they
-//! were attached to; blank lines kept with them are written too. Scalars keep
-//! their style where that is valid: plain text is written as it was (`7.20`),
-//! quoted ones stay quoted, and a flow collection stays flow while it holds
-//! only scalars and flow collections.
+//! were attached to; blank lines kept with them are written too. Scalars and
+//! keys keep their style where that is valid: plain text is written as it was
+//! (`7.20`), quoted ones stay quoted, and a flow collection stays flow while
+//! it holds no block collection and no comment.
+//!
+//! The output must read back to the same tree. What cannot (invalid UTF-8,
+//! nesting beyond `max_depth`) is an error, found before anything is written.
 //!
 //! Not kept: folded scalars (`>`) are written as literal (`|`) with the same
-//! value, a sequence indented like its key moves in by one step, a comment
-//! inside a flow collection is dropped, and spacing around `:` is normalized.
+//! value, a sequence indented like its key moves in by one step, spacing
+//! around `:` is normalized, and `...` is not written.
 
 const std = @import("std");
 const Writer = std.Io.Writer;
