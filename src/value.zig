@@ -204,6 +204,17 @@ pub const Map = struct {
     comments: std.StringArrayHashMapUnmanaged(Comments) = .empty,
     /// Written as `{a: 1, b: 2}`.
     flow: bool = false,
+    /// How keys were written in the source, for those where it matters:
+    /// quoted keys, and plain keys that YAML types as something other than a
+    /// string (`true:`, `12:`). A key without an entry, such as one added
+    /// through the API, is written so that it reads as a string.
+    key_styles: std.StringArrayHashMapUnmanaged(Style) = .empty,
+
+    /// Records how `key`, which must already be in the map, was written.
+    pub fn noteKeyStyle(self: *Map, arena: Allocator, key: []const u8, style: Style) Allocator.Error!void {
+        if (style == .plain and resolve(key) == .string) return;
+        try self.key_styles.put(arena, self.entries.getKey(key).?, style);
+    }
 
     pub fn count(self: *const Map) usize {
         return self.entries.count();
@@ -271,6 +282,7 @@ pub const Map = struct {
     /// Removes `key` and its comments, keeping the order of the rest.
     pub fn remove(self: *Map, key: []const u8) bool {
         _ = self.comments.orderedRemove(key);
+        _ = self.key_styles.orderedRemove(key);
         return self.entries.orderedRemove(key);
     }
 

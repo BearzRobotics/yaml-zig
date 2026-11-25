@@ -320,7 +320,7 @@ test "quotes and line breaks inside flow collections" {
 }
 
 test "flow pairs, comments and a trailing comma" {
-    try expectWritten("a: [k: v, \"q\":w, : x]\n", "a: [{k: v}, {q: w}, {\"\": x}]\n");
+    try expectWritten("a: [k: v, \"q\":w, : x]\n", "a: [{k: v}, {\"q\": w}, {: x}]\n");
     try expectWritten("a: [1, # inner\n  2, ] # outer\n", "a: [1, 2] # outer\n");
     try expectWritten("a: {x:\n  1,\n  y\n  : 2}\n", "a: {x: 1, y: 2}\n");
 }
@@ -612,4 +612,22 @@ test "a '|+' value does not absorb the blank lines after it" {
         try testing.expectEqualStrings(text, back.root.map.getString("b").?);
         try testing.expectEqualStrings("# end", back.footer[back.footer.len - 1]);
     }
+}
+
+test "keys keep their quotes and their YAML type" {
+    try roundTrips("\"true\": 1\n'123': 2\n\"null\": 3\nTrue: 4\n34: 5\n-1: 6\n-x: 7\n'it''s': 8\n\"a\": 9\n");
+    try roundTrips("a: {\"true\": 1, '2': 3, True: 4, \"x,y\": 5}\n");
+    try roundTrips(": empty\n");
+}
+
+test "keys added through the API read as strings" {
+    var doc = try yaml.Document.init(testing.allocator);
+    defer doc.deinit();
+    for ([_][]const u8{ "true", "12", "null", "", "plain", "a: b", "-", "x,y", "#", "{z}" }) |k| try doc.set(&.{k}, doc.boolean(true));
+    const out = try doc.toOwnedString(testing.allocator);
+    defer testing.allocator.free(out);
+    try testing.expectEqualStrings("\"true\": true\n\"12\": true\n\"null\": true\n\"\": true\nplain: true\n\"a: b\": true\n\"-\": true\nx,y: true\n\"#\": true\n\"{z}\": true\n", out);
+    var back = try parse(out);
+    defer back.deinit();
+    try testing.expectEqual(@as(usize, 10), back.root.map.count());
 }

@@ -329,7 +329,7 @@ const Parser = struct {
 
     // ---- mappings --------------------------------------------------------------------
 
-    const KeyInfo = struct { key: []const u8, rest: usize };
+    const KeyInfo = struct { key: []const u8, style: model.Style, rest: usize };
 
     /// If `content` (a line without its indent or comment) starts `key:`, the
     /// decoded key and the offset just after the colon.
@@ -351,7 +351,7 @@ const Parser = struct {
             var k = end;
             while (k < content.len and isWhite(content[k])) k += 1;
             if (k < content.len and content[k] == ':' and (k + 1 == content.len or isWhite(content[k + 1]))) {
-                return .{ .key = try self.decodeQuoted(content[0..end]), .rest = k + 1 };
+                return .{ .key = try self.decodeQuoted(content[0..end]), .style = if (c0 == '"') .double else .single, .rest = k + 1 };
             }
             return null;
         }
@@ -361,7 +361,7 @@ const Parser = struct {
                 // The key may be empty (`: value`).
                 const key = std.mem.trimEnd(u8, content[0..i], " \t");
                 try self.checkPrintable(key);
-                return .{ .key = try self.a.dupe(u8, key), .rest = i + 1 };
+                return .{ .key = try self.a.dupe(u8, key), .style = .plain, .rest = i + 1 };
             }
         }
         return null;
@@ -403,6 +403,7 @@ const Parser = struct {
                 after = self.takeTrailing();
             }
             try map.entries.put(self.a, ki.key, v);
+            try map.noteKeyStyle(self.a, ki.key, ki.style);
             if (before.len != 0 or after != null) try map.comments.put(self.a, ki.key, .{ .before = before, .after = after });
         }
         return .{ .map = map };
@@ -887,11 +888,14 @@ const Flow = struct {
         return .{ .key = key, .value = value };
     }
 
-    fn keyText(self: *Flow, key: Value) Error![]const u8 {
-        return switch (key) {
-            .scalar => |s| s.text,
-            else => self.p.unsupported("a collection as a key is not supported"),
+    fn put(self: *Flow, m: *Map, key: Value, value: Value) Error!void {
+        const s = switch (key) {
+            .scalar => |s| s,
+            else => return self.p.unsupported("a collection as a key is not supported"),
         };
+        if (m.entries.contains(s.text)) return self.p.err("duplicate key");
+        try m.entries.put(self.p.a, s.text, value);
+        try m.noteKeyStyle(self.p.a, s.text, s.style);
     }
 
     /// Consumes the `,` after an entry, or stops before the closing bracket.
@@ -918,7 +922,7 @@ const Flow = struct {
             if (e.value) |v| {
                 const pair = try self.p.a.create(Map);
                 pair.* = .{ .flow = true };
-                try pair.entries.put(self.p.a, try self.keyText(e.key), v);
+                try self.put(pair, e.key, v);
                 try s.append(self.p.a, .{ .map = pair });
             } else try s.append(self.p.a, e.key);
             try self.separator(']', "expected ',' or ']' in a flow sequence");
@@ -938,9 +942,7 @@ const Flow = struct {
                 return .{ .map = m };
             }
             const e = try self.entry(true);
-            const key = try self.keyText(e.key);
-            if (m.entries.contains(key)) return self.p.err("duplicate key");
-            try m.entries.put(self.p.a, key, e.value orelse null_scalar);
+            try self.put(m, e.key, e.value orelse null_scalar);
             try self.separator('}', "expected ',' or '}' in a flow mapping");
         }
     }

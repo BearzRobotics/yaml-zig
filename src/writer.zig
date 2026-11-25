@@ -135,7 +135,7 @@ const Gen = struct {
                 try self.lines(c.before, indent);
                 try self.pad(indent);
             }
-            if (indent == 0 and looksLikeMarker(k)) try self.double(k) else try self.key(k);
+            try self.key(m, k, indent == 0, false);
             try self.w.writeByte(':');
             try self.entryValue(v, c.after, indent);
         }
@@ -264,15 +264,34 @@ const Gen = struct {
         self.after_keep = keep;
     }
 
-    fn key(self: *Gen, k: []const u8) Error!void {
-        if (keyOk(k)) return self.w.writeAll(k);
-        try self.double(k);
+    fn key(self: *Gen, m: *const Map, k: []const u8, at_column_0: bool, in_flow: bool) Error!void {
+        const noted = m.key_styles.get(k);
+        switch (noted orelse .plain) {
+            .plain => {
+                // A key added through the API is a string, so it is quoted if
+                // a plain one would read as another type.
+                const typed = model.resolve(k) != .string;
+                // `: value`, an empty plain key.
+                if (noted != null and k.len == 0) return;
+                if ((noted != null or !typed) and keyOk(k, in_flow) and !(at_column_0 and looksLikeMarker(k)))
+                    return self.w.writeAll(k);
+                try self.double(k);
+            },
+            .single => try self.scalarInline(.{ .text = k, .style = .single }, in_flow),
+            else => try self.double(k),
+        }
     }
 
-    fn keyOk(k: []const u8) bool {
-        if (k.len == 0) return false;
-        if (std.mem.findScalar(u8, "-?:,[]{}#&*!|>'\"%@`", k[0]) != null) return false;
-        return plainBody(k);
+    fn keyOk(k: []const u8, in_flow: bool) bool {
+        if (k.len == 0 or !indicatorOk(k) or !plainBody(k)) return false;
+        return !in_flow or std.mem.findAny(u8, k, ",[]{}") == null;
+    }
+
+    /// A plain scalar cannot start with an indicator, except for `-`, `?` and
+    /// `:` before a character that is not a blank (`-foo`).
+    fn indicatorOk(s: []const u8) bool {
+        if (std.mem.findScalar(u8, "-?:,[]{}#&*!|>'\"%@`", s[0]) == null) return true;
+        return (s[0] == '-' or s[0] == '?' or s[0] == ':') and s.len > 1 and s[1] != ' ';
     }
 
     /// Characters and sequences that cannot appear in a plain scalar.
@@ -292,11 +311,7 @@ const Gen = struct {
     fn plainOk(s: Scalar, in_flow: bool) bool {
         if (s.text.len == 0) return false;
         if (model.resolve(s.text) != s.kind) return false;
-        if (std.mem.findScalar(u8, "-?:,[]{}#&*!|>'\"%@`", s.text[0]) != null) {
-            // `-foo` and `?foo` are fine; `- foo` and a bare `-` are not.
-            const c = s.text[0];
-            if (!((c == '-' or c == '?' or c == ':') and s.text.len > 1 and s.text[1] != ' ')) return false;
-        }
+        if (!indicatorOk(s.text)) return false;
         if (!plainBody(s.text)) return false;
         if (in_flow and std.mem.findAny(u8, s.text, ",[]{}") != null) return false;
         return true;
@@ -406,7 +421,7 @@ const Gen = struct {
                 try self.w.writeByte('{');
                 for (m.entries.keys(), m.entries.values(), 0..) |k, item, i| {
                     if (i != 0) try self.w.writeAll(", ");
-                    if (keyOk(k) and std.mem.findAny(u8, k, ",[]{}") == null) try self.w.writeAll(k) else try self.double(k);
+                    try self.key(m, k, false, true);
                     try self.w.writeAll(": ");
                     try self.flow(item);
                 }
