@@ -81,8 +81,14 @@ pub const Document = struct {
     pub fn parseReader(gpa: Allocator, r: *std.Io.Reader, options: Options, diag: ?*Diagnostic) ParseReaderError!Document {
         const bytes = r.allocRemaining(gpa, .limited(options.max_bytes)) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.StreamTooLong => return error.LimitExceeded,
-            error.ReadFailed => return error.ReadFailed,
+            error.StreamTooLong => {
+                if (diag) |d| d.* = .{ .line = 1, .column = 1, .message = "input too large" };
+                return error.LimitExceeded;
+            },
+            error.ReadFailed => {
+                if (diag) |d| d.* = .{ .line = 1, .column = 1, .message = "read failed" };
+                return error.ReadFailed;
+            },
         };
         defer gpa.free(bytes);
         return parse(gpa, bytes, options, diag);

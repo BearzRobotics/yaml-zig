@@ -31,7 +31,7 @@ pub const Error = error{
     /// Valid YAML this library does not read: anchors, aliases, tags, complex keys, several documents.
     Unsupported,
     InvalidUtf8,
-    /// Nesting, line count or input size exceeded `Options` limits.
+    /// Nesting or input size exceeded `Options` limits.
     LimitExceeded,
     OutOfMemory,
 };
@@ -122,14 +122,25 @@ const Parser = struct {
     seen_item: bool = false,
     depth: u32 = 0,
     step: u8 = 0,
+    /// Column of the quote that opens the quoted scalar read last.
+    quote_column: usize = 1,
 
     fn err(self: *Parser, msg: []const u8) Error {
-        const line = @min(self.pos + 1, self.lines.len);
-        return failAt(self.diag, line, 1, msg, error.Syntax);
+        return self.fail(msg, error.Syntax);
     }
 
     fn unsupported(self: *Parser, msg: []const u8) Error {
-        return failAt(self.diag, @min(self.pos + 1, self.lines.len), 1, msg, error.Unsupported);
+        return self.fail(msg, error.Unsupported);
+    }
+
+    /// The column at which `suffix`, the end of the current line, starts.
+    fn columnOf(self: *const Parser, suffix: []const u8) usize {
+        return self.lines[self.pos].len - suffix.len + 1;
+    }
+
+    /// Reports a syntax error at the start of `suffix`.
+    fn errAt(self: *Parser, suffix: []const u8, msg: []const u8) Error {
+        return failAt(self.diag, self.pos + 1, self.columnOf(suffix), msg, error.Syntax);
     }
 
     // ---- lines ---------------------------------------------------------------
@@ -289,8 +300,11 @@ const Parser = struct {
         self.depth += 1;
     }
 
+    /// Reports `e` on the current line, at its first character after the indent.
     fn fail(self: *Parser, msg: []const u8, e: Error) Error {
-        return failAt(self.diag, @min(self.pos + 1, self.lines.len), 1, msg, e);
+        const index = @min(self.pos, self.lines.len -| 1);
+        const column = if (self.lines.len == 0) 1 else indentOf(self.lines[index]) + 1;
+        return failAt(self.diag, index + 1, column, msg, e);
     }
 
     /// A node nested deeper than `parent` (an indent, or -1 at the top).
@@ -401,6 +415,7 @@ const Parser = struct {
             var k = end;
             while (k < content.len and isWhite(content[k])) k += 1;
             if (k < content.len and content[k] == ':' and (k + 1 == content.len or isWhite(content[k + 1]))) {
+                self.quote_column = indentOf(self.lines[self.pos]) + 1;
                 return .{ .key = try self.decodeQuoted(content[0..end]), .style = if (c0 == '"') .double else .single, .rest = k + 1 };
             }
             return null;
@@ -474,14 +489,14 @@ const Parser = struct {
         const c = rest[0];
         switch (c) {
             '&', '*', '!' => return self.unsupported("anchors, aliases and tags are not supported"),
-            '@', '`' => return self.err("a reserved indicator cannot start a scalar"),
-            '%' => return self.err("a '%' cannot start a plain scalar"),
+            '@', '`' => return self.errAt(rest, "a reserved indicator cannot start a scalar"),
+            '%' => return self.errAt(rest, "a '%' cannot start a plain scalar"),
             '"', '\'' => return self.quotedScalar(rest, parent),
             '|', '>' => return self.blockScalar(rest, parent),
             '[', '{' => return self.flowValue(rest, parent),
-            ',', ']', '}', '#' => return self.err("this indicator cannot start a plain scalar"),
+            ',', ']', '}', '#' => return self.errAt(rest, "this indicator cannot start a plain scalar"),
             '-', '?', ':' => {
-                if (rest.len == 1 or isWhite(rest[1])) return self.err("this indicator cannot start a plain scalar here");
+                if (rest.len == 1 or isWhite(rest[1])) return self.errAt(rest, "this indicator cannot start a plain scalar here");
                 return self.plainScalar(rest, parent);
             },
             else => return self.plainScalar(rest, parent),
@@ -505,15 +520,18 @@ const Parser = struct {
         try buf.appendSlice(self.gpa, first);
         var scan: QuoteScan = .{ .quote = first[0] };
         var line = first;
+        const first_line = self.pos;
+        const column = self.columnOf(first);
         const end = while (true) {
             if (scan.find(buf.items)) |e| break e;
             self.pos += 1;
-            if (self.pos >= self.lines.len) return self.err("unterminated quoted scalar");
+            if (self.pos >= self.lines.len) return failAt(self.diag, first_line + 1, column, "unterminated quoted scalar", error.Syntax);
             line = self.lines[self.pos];
             try self.checkContinuation(line, parent);
             try buf.append(self.gpa, '\n');
             try buf.appendSlice(self.gpa, line);
         };
+        self.quote_column = column;
         return .{
             .quoted = try self.a.dupe(u8, buf.items[0..end]),
             .tail = line[line.len - (buf.items.len - end) ..],
@@ -523,8 +541,8 @@ const Parser = struct {
     fn quotedScalar(self: *Parser, first: []const u8, parent: i64) Error!Value {
         const g = try self.gatherQuoted(first, parent);
         const tail = splitPlain(g.tail);
-        if (g.tail.len != 0 and g.tail[0] == '#') return self.err("a comment needs a blank before '#'");
-        if (std.mem.trim(u8, tail.content, " \t").len != 0) return self.err("unexpected text after a quoted scalar");
+        if (g.tail.len != 0 and g.tail[0] == '#') return self.errAt(g.tail, "a comment needs a blank before '#'");
+        if (std.mem.trim(u8, tail.content, " \t").len != 0) return self.errAt(std.mem.trimStart(u8, g.tail, " \t"), "unexpected text after a quoted scalar");
         self.trailing = if (tail.comment) |t| try self.keepComment(t) else null;
         const s = try self.decodeQuoted(g.quoted);
         self.pos += 1;
@@ -544,7 +562,9 @@ const Parser = struct {
         const sc = splitPlain(first);
         var out: std.ArrayList(u8) = .empty;
         const head = std.mem.trimEnd(u8, sc.content, " \t");
-        if (hasMappingIndicator(head)) return self.err("':' followed by a blank cannot appear in a plain scalar");
+        if (hasMappingIndicator(head)) return self.errAt(first, "':' followed by a blank cannot appear in a plain scalar");
+        try self.checkPrintable(head);
+        if (sc.comment) |t| try self.checkPrintable(t);
         try out.appendSlice(self.a, head);
         var comment = sc.comment;
         self.pos += 1;
@@ -563,15 +583,17 @@ const Parser = struct {
             // Only a comment line leaves nothing here.
             if (t.len == 0) break;
             if (hasMappingIndicator(t)) return self.err("unexpected content after a plain scalar (bad indentation?)");
+            self.pos = j;
+            try self.checkPrintable(t);
+            if (part.comment) |text| try self.checkPrintable(text);
             if (blanks == 0) try out.append(self.a, ' ') else try out.appendNTimes(self.a, '\n', blanks);
             try out.appendSlice(self.a, t);
             comment = part.comment;
             self.pos = j + 1;
         }
-        self.trailing = if (comment) |t| try self.keepComment(t) else null;
+        // Checked above, on the line where it stands.
+        self.trailing = if (comment) |t| try self.a.dupe(u8, t) else null;
         const text = out.items;
-        var parts = std.mem.splitScalar(u8, text, '\n');
-        while (parts.next()) |part| try self.checkPrintable(part);
         return .{ .scalar = .{ .text = text, .style = .plain, .kind = model.resolve(text) } };
     }
 
@@ -645,6 +667,7 @@ const Parser = struct {
         while (i < body_end) : (i += 1) {
             const l = self.lines[i];
             const text = if (l.len > ci) l[ci..] else "";
+            self.pos = i;
             try self.checkPrintable(text);
             try lines.append(self.a, text);
         }
@@ -746,7 +769,7 @@ const Parser = struct {
                 continue;
             }
             i += 1;
-            if (i >= body.len) return self.err("bad escape in a double-quoted scalar");
+            if (i >= body.len) return self.escapeError(q, i, "bad escape in a double-quoted scalar");
             switch (body[i]) {
                 '0' => try out.append(self.a, 0),
                 'a' => try out.append(self.a, 7),
@@ -767,13 +790,13 @@ const Parser = struct {
                 'P' => try out.appendSlice(self.a, "\u{2029}"),
                 'x', 'u', 'U' => {
                     const n: usize = if (body[i] == 'x') 2 else if (body[i] == 'u') 4 else 8;
-                    if (i + 1 + n > body.len) return self.err("bad escape in a double-quoted scalar");
+                    if (i + 1 + n > body.len) return self.escapeError(q, i, "bad escape in a double-quoted scalar");
                     const digits = body[i + 1 .. i + 1 + n];
                     // `parseInt` alone would also take a sign and underscores.
-                    for (digits) |d| if (!std.ascii.isHex(d)) return self.err("bad escape in a double-quoted scalar");
-                    const cp = std.fmt.parseInt(u21, digits, 16) catch return self.err("bad escape in a double-quoted scalar");
+                    for (digits) |d| if (!std.ascii.isHex(d)) return self.escapeError(q, i, "bad escape in a double-quoted scalar");
+                    const cp = std.fmt.parseInt(u21, digits, 16) catch return self.escapeError(q, i, "bad escape in a double-quoted scalar");
                     var buf: [4]u8 = undefined;
-                    const len = std.unicode.utf8Encode(cp, &buf) catch return self.err("bad escape in a double-quoted scalar");
+                    const len = std.unicode.utf8Encode(cp, &buf) catch return self.escapeError(q, i, "bad escape in a double-quoted scalar");
                     try out.appendSlice(self.a, buf[0..len]);
                     i += n;
                 },
@@ -787,11 +810,20 @@ const Parser = struct {
                         } else if (!isWhite(body[i + 1])) break;
                     }
                 },
-                else => return self.err("unknown escape in a double-quoted scalar"),
+                else => return self.escapeError(q, i, "unknown escape in a double-quoted scalar"),
             }
             keep = out.items.len;
         }
         return out.items;
+    }
+
+    /// Reports the bad escape whose backslash is just before byte `i` of the
+    /// body of `q`, a quoted scalar that ends on the current line.
+    fn escapeError(self: *Parser, q: []const u8, i: usize, msg: []const u8) Error {
+        const at = @min(i, q.len - 1); // the backslash, as an offset into `q`
+        const line = self.pos + 1 - std.mem.count(u8, q[at..], "\n");
+        const column = if (std.mem.lastIndexOfScalar(u8, q[0..at], '\n')) |nl| at - nl else self.quote_column + at;
+        return failAt(self.diag, line, column, msg, error.Syntax);
     }
 
     /// Length of `s` without trailing blanks.
@@ -812,6 +844,12 @@ const Flow = struct {
     /// Indent of the enclosing block node; further lines must go past it.
     parent: i64,
 
+    /// A syntax error at the cursor.
+    fn err(self: *Flow, msg: []const u8) Error {
+        const line = @min(self.p.pos, self.p.lines.len - 1);
+        return failAt(self.p.diag, line + 1, @min(self.i, self.line.len) + 1, msg, error.Syntax);
+    }
+
     fn peek(self: *const Flow) ?u8 {
         return if (self.i < self.line.len) self.line[self.i] else null;
     }
@@ -831,7 +869,7 @@ const Flow = struct {
                 if (!comment) return;
             }
             self.p.pos += 1;
-            if (self.p.pos >= self.p.lines.len) return self.p.err("unterminated flow collection");
+            if (self.p.pos >= self.p.lines.len) return self.err("unterminated flow collection");
             self.line = self.p.lines[self.p.pos];
             self.i = 0;
             const body = std.mem.trimStart(u8, self.line, " \t");
@@ -850,7 +888,7 @@ const Flow = struct {
     }
 
     fn node(self: *Flow) Error!Value {
-        const c = self.peek() orelse return self.p.err("expected a value in a flow collection");
+        const c = self.peek() orelse return self.err("expected a value in a flow collection");
         switch (c) {
             '[' => return self.seq(),
             '{' => return self.map(),
@@ -862,12 +900,12 @@ const Flow = struct {
                 return .{ .scalar = .{ .text = t, .style = if (c == '"') .double else .single, .kind = .string } };
             },
             '&', '*', '!' => return self.p.unsupported("anchors, aliases and tags are not supported"),
-            ',', ']', '}' => return self.p.err("a flow collection entry cannot be empty"),
-            '|', '>', '%', '@', '`', '#' => return self.p.err("this character cannot start a value in a flow collection"),
+            ',', ']', '}' => return self.err("a flow collection entry cannot be empty"),
+            '|', '>', '%', '@', '`', '#' => return self.err("this character cannot start a value in a flow collection"),
             '?', ':', '-' => {
                 if (self.separatorFollows()) {
                     if (c == '?') return self.p.unsupported("complex keys are not supported");
-                    return self.p.err("this indicator cannot start a value in a flow collection");
+                    return self.err("this indicator cannot start a value in a flow collection");
                 }
                 return self.plain();
             },
@@ -888,9 +926,15 @@ const Flow = struct {
         return std.mem.trimEnd(u8, self.line[start..self.i], " \t");
     }
 
+    fn appendPlainLine(self: *Flow, out: *std.ArrayList(u8)) Error!void {
+        const part = self.plainLine();
+        try self.p.checkPrintable(part);
+        try out.appendSlice(self.p.a, part);
+    }
+
     fn plain(self: *Flow) Error!Value {
         var out: std.ArrayList(u8) = .empty;
-        try out.appendSlice(self.p.a, self.plainLine());
+        try self.appendPlainLine(&out);
         // It goes on while the following lines start with plain text.
         while (self.i == self.line.len) {
             var j = self.p.pos + 1;
@@ -910,11 +954,9 @@ const Flow = struct {
             self.p.pos = j;
             self.line = next;
             self.i = next.len - body.len;
-            try out.appendSlice(self.p.a, self.plainLine());
+            try self.appendPlainLine(&out);
         }
         const text = out.items;
-        var parts = std.mem.splitScalar(u8, text, '\n');
-        while (parts.next()) |part| try self.p.checkPrintable(part);
         return .{ .scalar = .{ .text = text, .style = .plain, .kind = model.resolve(text) } };
     }
 
@@ -936,7 +978,7 @@ const Flow = struct {
         if (in_mapping) try self.skip() else self.skipInLine();
         // `"key":value` may leave out the blank after the colon.
         if (self.peek() != ':' or !(json_like or self.separatorFollows())) return .{ .key = key, .value = null };
-        if (!in_mapping and self.p.pos != first_line) return self.p.err("a key in a flow sequence must be on one line");
+        if (!in_mapping and self.p.pos != first_line) return self.err("a key in a flow sequence must be on one line");
         self.i += 1;
         try self.skip();
         const c = self.peek().?;
@@ -949,7 +991,7 @@ const Flow = struct {
             .scalar => |s| s,
             else => return self.p.unsupported("a collection as a key is not supported"),
         };
-        if (m.entries.contains(s.text)) return self.p.err("duplicate key");
+        if (m.entries.contains(s.text)) return self.err("duplicate key");
         try m.entries.put(self.p.a, s.text, value);
         try m.noteKeyStyle(self.p.a, s.text, s.style);
     }
@@ -959,7 +1001,7 @@ const Flow = struct {
         try self.skip();
         if (self.peek() == ',') {
             self.i += 1;
-        } else if (self.peek() != close) return self.p.err(msg);
+        } else if (self.peek() != close) return self.err(msg);
     }
 
     fn seq(self: *Flow) Error!Value {

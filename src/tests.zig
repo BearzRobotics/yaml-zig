@@ -752,3 +752,30 @@ test "what is written respects max_depth, so it can be read again" {
     try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, "[[k: v]]\n", opts, null));
     try testing.expectError(error.LimitExceeded, yaml.Document.parse(testing.allocator, "[k: [[v]]]\n", opts, null));
 }
+
+test "diagnostics give the line and column of the error" {
+    const Case = struct { src: []const u8, line: usize, column: usize };
+    for ([_]Case{
+        .{ .src = "a: \"\\q\"\nb: 1\nc: 2\n", .line = 1, .column = 5 },
+        .{ .src = "a: \"x\n  \\q\n  y\"\nb: 1\n", .line = 2, .column = 3 },
+        .{ .src = "a: [1] x\nb: 1\nc: 2\n", .line = 1, .column = 1 },
+        .{ .src = "a: \"x\" y\nb: 1\n", .line = 1, .column = 8 },
+        .{ .src = "a: [1, , 2]\n", .line = 1, .column = 8 },
+        .{ .src = "a: b: c\nd: 1\n", .line = 1, .column = 4 },
+        .{ .src = "a: 1\nb: \"open\n  more\n", .line = 2, .column = 4 },
+        .{ .src = "a: x\n  y\x7f\nb: 1\n", .line = 2, .column = 3 },
+        .{ .src = "a: |\n  x\x7f\n  y\nb: 1\n", .line = 2, .column = 3 },
+        .{ .src = "k:\n  a: 1\n  a: 2\n", .line = 3, .column = 3 },
+    }) |case| {
+        errdefer std.debug.print("source: {s}\n", .{case.src});
+        var diag: yaml.Diagnostic = .{};
+        try testing.expectError(error.Syntax, yaml.Document.parse(testing.allocator, case.src, .{}, &diag));
+        try testing.expectEqual(case.line, diag.line);
+        try testing.expectEqual(case.column, diag.column);
+        try testing.expect(diag.message.len != 0);
+    }
+    var r: std.Io.Reader = .fixed("a: 12345\n");
+    var diag: yaml.Diagnostic = .{};
+    try testing.expectError(error.LimitExceeded, yaml.Document.parseReader(testing.allocator, &r, .{ .max_bytes = 3 }, &diag));
+    try testing.expectEqualStrings("input too large", diag.message);
+}
