@@ -812,3 +812,10 @@ test "an empty entry leaves the following comments where they are" {
     try roundTrips("- # one\n# two\n- # three\n# end\n");
     try roundTrips("a:\n# about b\nb:\n# end\n");
 }
+
+test "the indentation step comes from nested collections only" {
+    try expectStable("a:\n |\n  x\n", "a: |\n  x\n");
+    var doc = try parse("a:\n   v\nb:\n    c: 1\n");
+    defer doc.deinit();
+    try testing.expectEqual(@as(u8, 4), doc.indent);
+}

@@ -207,6 +207,14 @@ const Parser = struct {
         return self.a.dupe([]const u8, self.pending.items);
     }
 
+    /// Takes the document's indentation step from the first block collection
+    /// nested under an item at `indent`. A scalar on its own line says
+    /// nothing: it is written back on the item's line.
+    fn learnStep(self: *Parser, child: Cur, indent: usize) Error!void {
+        if (self.step != 0 or child.indent - indent > 8 or child.tabbed) return;
+        if (isSeqEntry(child.content) or try self.splitKey(child.content) != null) self.step = @intCast(child.indent - indent);
+    }
+
     /// A scalar or a flow collection: a value with no items that could carry
     /// comments of their own.
     fn isOneNode(v: Value) bool {
@@ -362,7 +370,7 @@ const Parser = struct {
                 try self.skipBlank();
                 const next = try self.cur();
                 const present = next != null and next.?.indent > indent;
-                if (present and self.step == 0 and next.?.indent - indent <= 8) self.step = @intCast(next.?.indent - indent);
+                if (present) try self.learnStep(next.?, indent);
                 item = try self.block(@intCast(indent));
                 // After a null item, pending comments belong to what follows.
                 if (present) {
@@ -459,7 +467,7 @@ const Parser = struct {
                 try self.skipBlank();
                 const next = try self.cur();
                 if (next != null and next.?.indent > indent) {
-                    if (self.step == 0 and next.?.indent - indent <= 8) self.step = @intCast(next.?.indent - indent);
+                    try self.learnStep(next.?, indent);
                     v = try self.block(@intCast(indent));
                 } else if (next != null and next.?.indent == indent and !next.?.tabbed and isSeqEntry(next.?.content)) {
                     try self.enter();
