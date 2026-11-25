@@ -93,6 +93,7 @@ pub fn parse(gpa: Allocator, arena: Allocator, source: []const u8, options: Opti
 
     var p: Parser = .{ .a = arena, .gpa = gpa, .lines = lines.items, .options = options, .diag = diag };
     defer p.pending.deinit(gpa);
+    defer p.scratch.deinit(gpa);
     return p.document();
 }
 
@@ -118,6 +119,10 @@ const Parser = struct {
     options: Options,
     diag: ?*Diagnostic,
     pending: std.ArrayList([]const u8) = .empty,
+    /// Where the text of one scalar is put together before it is copied to the
+    /// arena. Reused, so that a document with many scalars does not allocate
+    /// and free a buffer for each.
+    scratch: std.ArrayList(u8) = .empty,
     trailing: ?[]const u8 = null,
     seen_item: bool = false,
     depth: u32 = 0,
@@ -526,8 +531,8 @@ const Parser = struct {
     /// in one growable buffer and the search for the closing quote resumes
     /// where it stopped, so the cost stays linear in the size of the scalar.
     fn gatherQuoted(self: *Parser, first: []const u8, parent: i64) Error!Gathered {
-        var buf: std.ArrayList(u8) = .empty;
-        defer buf.deinit(self.gpa);
+        const buf = &self.scratch;
+        buf.clearRetainingCapacity();
         try buf.appendSlice(self.gpa, first);
         var scan: QuoteScan = .{ .quote = first[0] };
         var line = first;
@@ -937,15 +942,14 @@ const Flow = struct {
         return std.mem.trimEnd(u8, self.line[start..self.i], " \t");
     }
 
-    fn appendPlainLine(self: *Flow, out: *std.ArrayList(u8)) Error!void {
-        const part = self.plainLine();
-        try self.p.checkPrintable(part);
-        try out.appendSlice(self.p.a, part);
-    }
-
     fn plain(self: *Flow) Error!Value {
-        var out: std.ArrayList(u8) = .empty;
-        try self.appendPlainLine(&out);
+        // Gathered outside the arena and copied once, at its exact size: a
+        // large collection has very many short scalars.
+        const out = &self.p.scratch;
+        out.clearRetainingCapacity();
+        const head = self.plainLine();
+        try self.p.checkPrintable(head);
+        try out.appendSlice(self.p.gpa, head);
         // It goes on while the following lines start with plain text.
         while (self.i == self.line.len) {
             var j = self.p.pos + 1;
@@ -961,13 +965,15 @@ const Flow = struct {
             }
             try self.p.checkContinuation(next, self.parent);
             const blanks = j - self.p.pos - 1;
-            if (blanks == 0) try out.append(self.p.a, ' ') else try out.appendNTimes(self.p.a, '\n', blanks);
+            if (blanks == 0) try out.append(self.p.gpa, ' ') else try out.appendNTimes(self.p.gpa, '\n', blanks);
             self.p.pos = j;
             self.line = next;
             self.i = next.len - body.len;
-            try self.appendPlainLine(&out);
+            const part = self.plainLine();
+            try self.p.checkPrintable(part);
+            try out.appendSlice(self.p.gpa, part);
         }
-        const text = out.items;
+        const text = try self.p.a.dupe(u8, out.items);
         return .{ .scalar = .{ .text = text, .style = .plain, .kind = model.resolve(text) } };
     }
 
