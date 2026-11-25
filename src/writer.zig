@@ -106,7 +106,7 @@ const Gen = struct {
         switch (v) {
             .scalar => |s| {
                 if (isBlock(s) and blockOk(s.text)) {
-                    try self.blockScalar(s, 0, null);
+                    try self.blockScalar(s, 0, null, true);
                     return;
                 }
                 if (s.kind == .null and s.text.len == 0) return self.w.writeAll("null\n");
@@ -162,7 +162,7 @@ const Gen = struct {
             .scalar => |s| {
                 if (isBlock(s) and blockOk(s.text)) {
                     try self.w.writeByte(' ');
-                    return self.blockScalar(s, indent, after);
+                    return self.blockScalar(s, indent, after, false);
                 }
                 if (s.kind == .null and s.text.len == 0 and s.style == .plain) return self.tail(after);
                 try self.w.writeByte(' ');
@@ -224,29 +224,37 @@ const Gen = struct {
 
     /// `|` header (after a space the caller wrote), the comment, and the body
     /// indented one step past `indent`.
-    fn blockScalar(self: *Gen, s: Scalar, indent: usize, after: ?[]const u8) Error!void {
+    fn blockScalar(self: *Gen, s: Scalar, indent: usize, after: ?[]const u8, is_root: bool) Error!void {
         const text = s.text;
         var nl: usize = 0;
         while (nl < text.len and text[text.len - 1 - nl] == '\n') nl += 1;
         const body = text[0 .. text.len - nl];
-        try self.w.writeByte('|');
-        // A first line that starts with a blank needs the indentation spelled out.
+        // Keep chomping: more than one final newline, or nothing but newlines.
+        const keep = nl > 1 or (body.len == 0 and nl == 1);
+        // The reader takes the indentation from the first line that is not
+        // empty, so it must be spelled out if that line starts with a space.
+        // An empty root block needs it too: otherwise a comment after it, at
+        // column 0, would be read as its content.
         var first = body;
         while (first.len != 0 and first[0] == '\n') first = first[1..];
-        if (first.len != 0 and first[0] == ' ') try self.w.writeByte('0' + @as(u8, @intCast(@min(self.step, 9))));
+        const indicator = (first.len != 0 and first[0] == ' ') or (is_root and body.len == 0);
+        // The indicator is a single digit.
+        const step = if (indicator) @min(self.step, 9) else self.step;
+        try self.w.writeByte('|');
+        if (indicator) try self.w.writeByte('0' + @as(u8, @intCast(step)));
         // Clip (exactly one final newline) needs no marker.
-        if (nl == 0) try self.w.writeByte('-') else if (nl > 1) try self.w.writeByte('+');
+        if (keep) try self.w.writeByte('+') else if (nl == 0) try self.w.writeByte('-');
         try self.tail(after);
-        const bi = indent + self.step;
-        if (body.len != 0 or nl > 1) {
+        if (body.len != 0) {
             var it = std.mem.splitScalar(u8, body, '\n');
             while (it.next()) |l| {
-                if (l.len != 0) try self.pad(bi);
+                if (l.len != 0) try self.pad(indent + step);
                 try self.w.writeAll(l);
                 try self.w.writeByte('\n');
             }
-            if (nl > 1) try self.w.splatByteAll('\n', nl - 1);
         }
+        // With keep chomping each further newline is an empty line.
+        if (keep) try self.w.splatByteAll('\n', if (body.len != 0) nl - 1 else nl);
     }
 
     fn key(self: *Gen, k: []const u8) Error!void {

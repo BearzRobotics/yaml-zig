@@ -558,3 +558,43 @@ test "invalid UTF-8 is refused, not written" {
     doc.footer = &.{"# \xff"};
     try testing.expectError(error.InvalidUtf8, doc.toOwnedString(testing.allocator));
 }
+
+test "block scalars survive writing, whatever their shape" {
+    const texts = [_][]const u8{ "\n", "\n\n", "\n\n\n", "  \nfoo\n", "x\n   \ny\n", "x\n\t\ny\n", " lead\nx", "\tlead\nx\n", "\n  x\n\n\n", "a\n\nb", "---\n...\n", "# not a comment\n" };
+    for ([_]u8{ 1, 2, 4, 9, 12 }) |step| {
+        for (texts) |text| {
+            var doc = try yaml.Document.init(testing.allocator);
+            defer doc.deinit();
+            doc.indent = step;
+            try doc.set(&.{"k"}, try doc.string(text));
+            var seq = try doc.newSeq();
+            try seq.seq.append(doc.allocator(), try doc.string(text));
+            try doc.set(&.{"s"}, seq);
+            try doc.set(&.{"z"}, doc.boolean(true));
+            var back = try writeAndRead(&doc);
+            defer back.deinit();
+            try testing.expectEqualStrings(text, back.root.map.getString("k").?);
+            try testing.expectEqualStrings(text, back.root.map.getSeq("s").?.items.items[0].scalar.text);
+
+            doc.root = try doc.string(text);
+            var root_back = try writeAndRead(&doc);
+            defer root_back.deinit();
+            try testing.expectEqualStrings(text, root_back.root.scalar.text);
+        }
+    }
+}
+
+test "empty block scalars from a file" {
+    for ([_][]const u8{ "a: >-\n\nb: >\n\nc: |+\n\n", "- |+\n   \n", "# c\n|-\n" }) |src| {
+        var doc = try parse(src);
+        defer doc.deinit();
+        const out = try doc.toOwnedString(testing.allocator);
+        defer testing.allocator.free(out);
+        var back = try parse(out);
+        defer back.deinit();
+        const again = try back.toOwnedString(testing.allocator);
+        defer testing.allocator.free(again);
+        try testing.expectEqualStrings(out, again);
+        if (doc.root == .scalar) try testing.expectEqualStrings(doc.root.scalar.text, back.root.scalar.text);
+    }
+}
