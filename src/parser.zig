@@ -890,8 +890,22 @@ const Flow = struct {
             self.i = 0;
             const body = std.mem.trimStart(u8, self.line, " \t");
             // Comment lines may be indented any amount.
-            if (body.len != 0 and body[0] != '#') try self.p.checkContinuation(self.line, self.parent);
+            if (body.len != 0 and body[0] != '#' and !self.closesAtParent(self.line))
+                try self.p.checkContinuation(self.line, self.parent);
         }
+    }
+
+    /// A deliberate departure from YAML 1.2.2, which wants this line indented
+    /// further: a closing bracket may stand in the parent's own column.
+    ///
+    ///     os: [
+    ///       linux,
+    ///     ]
+    ///
+    /// This is common in real files, and libyaml-based readers accept it.
+    fn closesAtParent(self: *const Flow, line: []const u8) bool {
+        const column = Parser.indentOf(line);
+        return column == self.parent and column < line.len and (line[column] == ']' or line[column] == '}');
     }
 
     /// True if the byte after the current one cannot continue a plain scalar.

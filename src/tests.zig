@@ -990,3 +990,15 @@ test "a large multi-line flow collection" {
     defer doc.deinit();
     try testing.expectEqual(@as(usize, 100_000), doc.root.map.getSeq("a").?.items.items.len);
 }
+
+// A deliberate departure from the spec (see ai/SPEC.md).
+test "a closing bracket may stand in the parent's column" {
+    try expectWritten("a:\n  os: [\n    x, # c\n  ]\n  b: 1\n", "a:\n  os: [x]\n  b: 1\n");
+    try expectWritten("a:\n  r: ['e', {\n    b: 1\n  }]\n", "a:\n  r: ['e', {b: 1}]\n");
+    try expectWritten("- [\n  x\n]\n", "- [x]\n");
+    // Only the bracket, and only in that column.
+    try rejects("a:\n  os: [\n    x,\n  y]\n", error.Syntax);
+    try rejects("a:\n  os: [\n    x\n  , y]\n", error.Syntax);
+    try rejects("a:\n  os: [\n    x\n ]\n", error.Syntax);
+    try rejects("a:\n  os: [\n    x\n\t]\n", error.Syntax);
+}
