@@ -531,42 +531,65 @@ const Parser = struct {
         const literal = h[0] == '|';
         var chomp: enum { clip, strip, keep } = .clip;
         var explicit: usize = 0;
+        // At most one indentation digit and one chomping sign, in either order.
         for (h[1..]) |c| switch (c) {
-            '-' => chomp = .strip,
-            '+' => chomp = .keep,
-            '1'...'9' => explicit = c - '0',
+            '-', '+' => {
+                if (chomp != .clip) return self.err("bad block scalar header");
+                chomp = if (c == '-') .strip else .keep;
+            },
+            '1'...'9' => {
+                if (explicit != 0) return self.err("bad block scalar header");
+                explicit = c - '0';
+            },
             else => return self.err("bad block scalar header"),
         };
         self.trailing = if (sc.comment) |t| try self.keepComment(t) else null;
         self.pos += 1;
 
-        // The body is indented past the parent; its first non-blank line sets
-        // how far, unless an indicator says.
+        // The body is indented past the parent; its first line with anything
+        // but spaces sets how far, unless an indicator says.
         const floor: usize = if (parent < 0) 0 else @intCast(parent + 1);
         var content_indent: ?usize = null;
         if (explicit != 0) content_indent = (if (parent < 0) 0 else @as(usize, @intCast(parent))) + explicit;
+        var leading_spaces: usize = 0;
         var end = self.pos;
-        var last_content = self.pos; // one past the last non-blank line
+        var last_content = self.pos; // one past the last line that is not empty
         while (end < self.lines.len) : (end += 1) {
             const l = self.lines[end];
-            if (isBlank(l)) continue;
             if (isForbidden(l)) break;
-            const ind = indentOf(l);
-            if (content_indent == null) {
-                if (ind < floor) break;
-                content_indent = ind;
+            const spaces = indentOf(l);
+            if (spaces == l.len) {
+                // Only spaces: content if it goes past the indentation.
+                if (content_indent) |n| {
+                    if (spaces > n) last_content = end + 1;
+                } else leading_spaces = @max(leading_spaces, spaces);
+                continue;
             }
-            if (ind < content_indent.?) break;
+            const n = content_indent orelse blk: {
+                if (spaces < floor) {
+                    if (isBlank(l)) return self.fail("a tab cannot indent a line", error.Syntax);
+                    break;
+                }
+                if (leading_spaces > spaces) return self.err("an empty line is indented more than the first line of the block scalar");
+                content_indent = spaces;
+                break :blk spaces;
+            };
+            if (spaces < n) {
+                if (isBlank(l)) return self.err("a tab cannot indent a line");
+                break;
+            }
             last_content = end + 1;
         }
-        const ci = content_indent orelse 0;
+        // With no content at all, every line is empty.
+        const ci = content_indent orelse std.math.maxInt(usize);
         const body_end = if (chomp == .keep) end else last_content;
         var lines: std.ArrayList([]const u8) = .empty;
         var i = self.pos;
         while (i < body_end) : (i += 1) {
             const l = self.lines[i];
-            try self.checkPrintable(l);
-            try lines.append(self.a, if (isBlank(l) or l.len <= ci) "" else l[ci..]);
+            const text = if (l.len > ci) l[ci..] else "";
+            try self.checkPrintable(text);
+            try lines.append(self.a, text);
         }
         self.pos = body_end;
         // Blank lines after the body that were not taken stay for the next item.

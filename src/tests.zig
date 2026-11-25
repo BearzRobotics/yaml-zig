@@ -485,3 +485,20 @@ test "tabs separate but do not indent" {
         try rejects(src, error.Syntax);
     }
 }
+
+test "whitespace-only lines in a block scalar keep what is past the indent" {
+    try expectString("a: |\n  x\n     \n  y\n", "x\n   \ny\n");
+    try expectString("a: |\n  x\n  \t\n  y\n", "x\n\t\ny\n");
+    try expectString("a: |\n  x\n   \n", "x\n \n");
+    try expectString("a: |\n \n\n  x\n", "\n\nx\n");
+    try expectString("a: |\n    \nb: 1\n", "");
+    try expectString("a: >\n \t\n x\n", "\t\nx\n");
+}
+
+test "bad block scalars are rejected" {
+    for ([_][]const u8{ "a: |-+\n  x\n", "a: |++\n  x\n", "a: |12\n   x\n", "a: |0\n  x\n", "a: |#c\n  x\n", "a: |x\n  x\n", "a: >\n    \n  x\n", "a: |\n\t\nb: 1\n", "a: |\n  x\n\t\nb: 1\n" }) |src| {
+        try rejects(src, error.Syntax);
+    }
+    try expectString("a: |2-\n  x\n", "x");
+    try expectString("a: |-2 # c\n  x\n", "x");
+}
