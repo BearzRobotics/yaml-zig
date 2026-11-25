@@ -177,6 +177,11 @@ const Parser = struct {
     pending: std.ArrayList([]const u8) = .empty,
     /// At the start of the stream or after `...`: directives may follow.
     after_end: bool = true,
+    /// Set when a node turned out to be empty after lines of properties: how
+    /// many pending comment lines stood above them. The rest follow the node.
+    own_pending: ?usize = null,
+    /// The current document's `%TAG` handles and their prefixes.
+    handles: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Where the text of one scalar is put together before it is copied to the
     /// arena. Reused, so that a document with many scalars does not allocate
     /// and free a buffer for each.
@@ -310,7 +315,7 @@ const Parser = struct {
     /// the value, have no other owner than this item.
     fn commentsAround(self: *Parser, v: Value, before: []const []const u8, line_comment: ?[]const u8) Error!Comments {
         if (!isOneNode(v)) return .{ .before = before, .after = line_comment };
-        const between = try self.takeBefore();
+        const between = try self.takeAbove();
         const value_comment = self.takeTrailing();
         var lines: std.ArrayList([]const u8) = .empty;
         try lines.appendSlice(self.a, before);
@@ -337,7 +342,7 @@ const Parser = struct {
         // The prefix: `...` lines left over, and directives.
         var directives: std.ArrayList([]const u8) = .empty;
         var seen_yaml = false;
-        var handles: std.StringHashMapUnmanaged(void) = .empty;
+        self.handles = .empty;
         const first = while (true) {
             // A byte order mark may start any document.
             if (self.after_end and self.pos < self.lines.len and std.mem.startsWith(u8, self.lines[self.pos], byte_order_mark))
@@ -359,7 +364,9 @@ const Parser = struct {
                         seen_yaml = true;
                     },
                     .tag => |t| {
-                        if ((try handles.getOrPut(self.a, t.handle)).found_existing) return self.err("a second %TAG directive for one handle");
+                        const slot = try self.handles.getOrPut(self.a, try self.a.dupe(u8, t.handle));
+                        if (slot.found_existing) return self.err("a second %TAG directive for one handle");
+                        slot.value_ptr.* = try self.a.dupe(u8, t.prefix);
                     },
                     .reserved => {},
                 }
@@ -382,22 +389,39 @@ const Parser = struct {
                 self.pos += 1;
             } else inline_root = rest;
         } else if (directives.items.len != 0) return self.err("directives must be followed by '---'");
+        var props: Props = .{};
+        var props_comment: ?[]const u8 = null;
         if (inline_root) |rest| {
+            props = try self.takeProps(rest);
+            if (props.any() and endsLine(props.rest)) {
+                props_comment = try self.commentOn(props.rest);
+                inline_root = null;
+                self.pos += 1;
+            }
+        }
+        if (inline_root != null) {
             const on_marker_line = "a block collection cannot start on the '---' line";
-            if (isSeqEntry(rest)) return self.err(on_marker_line);
-            res.root = switch (try self.readNode(rest, -1, true)) {
+            if (isSeqEntry(props.rest)) return self.err(on_marker_line);
+            res.root = switch (try self.readNode(props.rest, -1, true)) {
                 .value => |v| v,
                 .key => return self.err(on_marker_line),
             };
+            try self.apply(&res.root, props);
             res.root_comments = .{ .after = self.takeTrailing() };
         } else {
             try self.skipBlank();
             const present = if (try self.cur()) |c| !isDocMarker(c) else false;
-            res.root = try self.block(-1, null);
+            res.root = try self.block(-1, null, props, false);
             if (present and isOneNode(res.root)) {
-                res.root_comments.before = try self.takeBefore();
+                res.root_comments.before = try self.takeAbove();
                 res.root_comments.after = self.takeTrailing();
             }
+        }
+        if (props_comment) |c| {
+            // A comment after the root's properties, above the root itself.
+            if (res.root_comments.after == null and isOneNode(res.root)) {
+                res.root_comments.after = c;
+            } else res.header = try std.mem.concat(self.a, []const u8, &.{ res.header, &.{c} });
         }
         try self.skipBlank();
         // Comments up to here, and on a first `...`, end this document. Any
@@ -477,37 +501,199 @@ const Parser = struct {
 
     /// A node on the lines below, indented more than `parent` (an indent, or -1
     /// at the top). `under` is the indent of the item it is nested in, if its
-    /// indentation says something about the document's step.
-    fn block(self: *Parser, parent: i64, under: ?usize) Error!Value {
+    /// indentation says something about the document's step. `outer` holds the
+    /// properties already read for it. With `sequence_at_parent`, as for a
+    /// mapping's value, a sequence may also stand in the parent's column.
+    fn block(self: *Parser, parent: i64, under: ?usize, outer: Props, sequence_at_parent: bool) Error!Value {
         try self.skipBlank();
-        const c = (try self.cur()) orelse return null_scalar;
-        if (@as(i64, @intCast(c.indent)) <= parent) return null_scalar;
-        if (isDocMarker(c)) return null_scalar;
+        const c = (try self.cur()) orelse return self.emptyNode(outer);
+        if (isDocMarker(c)) return self.emptyNode(outer);
+        if (@as(i64, @intCast(c.indent)) <= parent) {
+            if (!sequence_at_parent or c.indent != parent or c.tabbed or !isSeqEntry(c.content)) return self.emptyNode(outer);
+            try self.enter();
+            defer self.depth -= 1;
+            var v = try self.sequence(c.indent);
+            try self.apply(&v, outer);
+            return v;
+        }
         const rest = std.mem.trimStart(u8, self.lines[self.pos][c.indent..], " \t");
-        return self.collectionOrNode(rest, parent, c.indent, c.tabbed, under, "a tab cannot indent a line");
+        const props = try self.takeProps(rest);
+        if (props.any() and endsLine(props.rest)) {
+            // Properties on a line of their own belong to what follows. A node
+            // has at most one of each, so this does not recurse far.
+            if (try self.commentOn(props.rest)) |text| try self.pending.append(self.gpa, text);
+            const both = try self.merge(outer, props);
+            self.pos += 1;
+            const above = self.pending.items.len;
+            try self.skipBlank();
+            if (!try self.nodeFollows(parent, sequence_at_parent)) {
+                self.own_pending = above;
+                return self.emptyNode(both);
+            }
+            return self.block(parent, under, both, sequence_at_parent);
+        }
+        return self.collectionOrNode(rest, props, outer, parent, c.indent, c.tabbed, under, "a tab cannot indent a line");
+    }
+
+    /// Whether the current line is part of a node nested under `parent`.
+    fn nodeFollows(self: *Parser, parent: i64, sequence_at_parent: bool) Error!bool {
+        const c = (try self.cur()) orelse return false;
+        if (isDocMarker(c)) return false;
+        if (@as(i64, @intCast(c.indent)) > parent) return true;
+        return sequence_at_parent and c.indent == parent and !c.tabbed and isSeqEntry(c.content);
+    }
+
+    /// The pending comments that stand above a node just read.
+    fn takeAbove(self: *Parser) Error![]const []const u8 {
+        const count = self.own_pending orelse return self.takeBefore();
+        self.own_pending = null;
+        self.seen_item = true;
+        const above = try self.dupeLines(self.pending.items[0..count]);
+        self.pending.replaceRangeAssumeCapacity(0, count, &.{});
+        return above;
     }
 
     /// What starts at `rest`, in column `column` of the current line, where a
-    /// block collection may start. One cannot if tabs lead up to it.
-    fn collectionOrNode(self: *Parser, rest: []const u8, parent: i64, column: usize, tabbed: bool, under: ?usize, tab_message: []const u8) Error!Value {
-        if (isSeqEntry(rest)) {
+    /// block collection may start. One cannot if tabs lead up to it. `props`
+    /// are the properties at the start of `rest`; `outer` those from before.
+    fn collectionOrNode(self: *Parser, rest: []const u8, props: Props, outer: Props, parent: i64, column: usize, tabbed: bool, under: ?usize, tab_message: []const u8) Error!Value {
+        if (isSeqEntry(props.rest)) {
+            if (props.any()) return self.errAt(props.rest, "a block sequence cannot start on its properties' line");
             if (tabbed) return self.err(tab_message);
             try self.enterAt(rest);
             defer self.depth -= 1;
             self.learnStep(column, under);
-            return self.sequence(column);
+            var v = try self.sequence(column);
+            try self.apply(&v, outer);
+            return v;
         }
-        switch (try self.readNode(rest, parent, true)) {
-            .value => |v| return v,
-            .key => |key| {
+        switch (try self.readNode(props.rest, parent, true)) {
+            .value => |value| {
+                var v = value;
+                try self.apply(&v, try self.merge(outer, props));
+                return v;
+            },
+            .key => |found| {
                 if (tabbed) return self.err(tab_message);
-                // The key may have moved `pos` no further: it is on one line.
+                // Properties on the key's line are the key's; those from the
+                // lines above are the mapping's.
+                var key = found;
+                key.column = self.columnOf(rest);
+                try self.apply(&key.value, props);
                 try self.enterAt(rest);
                 defer self.depth -= 1;
                 self.learnStep(column, under);
-                return self.mapping(column, key);
+                var v = try self.mapping(column, key);
+                try self.apply(&v, outer);
+                return v;
             },
         }
+    }
+
+    // ---- node properties -------------------------------------------------------------
+
+    const Props = struct {
+        tag: ?[]const u8 = null,
+        /// What follows the properties on their line.
+        rest: []const u8 = "",
+
+        fn any(self: Props) bool {
+            return self.tag != null;
+        }
+    };
+
+    /// Reads the properties at the start of `rest`, if any.
+    fn takeProps(self: *Parser, rest: []const u8) Error!Props {
+        var props: Props = .{ .rest = rest };
+        while (props.rest.len != 0) {
+            switch (props.rest[0]) {
+                '&' => return self.failHere(props.rest, "anchors and aliases are not supported", error.Unsupported),
+                '!' => {
+                    if (props.tag != null) return self.errAt(props.rest, "a node cannot have two tags");
+                    const tag = try self.readTag(props.rest, false) orelse return self.errAt(props.rest, "bad tag");
+                    props.tag = tag.name;
+                    props.rest = std.mem.trimStart(u8, props.rest[tag.len..], " \t");
+                },
+                else => break,
+            }
+        }
+        return props;
+    }
+
+    const Tag = struct { name: []const u8, len: usize };
+
+    /// The tag that starts `s`, resolved to its full name, or null if it is
+    /// badly formed or its handle is unknown. It must be followed by a blank,
+    /// the end of the line or, `in_flow`, what ends a flow entry.
+    fn readTag(self: *Parser, s: []const u8, in_flow: bool) Error!?Tag {
+        var end: usize = 1;
+        var name: []const u8 = undefined;
+        if (s.len > 1 and s[1] == '<') {
+            // Verbatim: taken as it is.
+            const close = std.mem.indexOfScalar(u8, s, '>') orelse return null;
+            const uri = s[2..close];
+            if (!model.isVerbatimTag(uri)) return null;
+            name = try self.a.dupe(u8, uri);
+            end = close + 1;
+        } else {
+            while (end < s.len and !isWhite(s[end]) and std.mem.findScalar(u8, ",[]{}", s[end]) == null) end += 1;
+            const token = s[0..end];
+            if (token.len == 1) {
+                name = "!";
+            } else {
+                // `!!suffix`, `!name!suffix` or `!suffix`.
+                const second = std.mem.indexOfScalarPos(u8, token, 1, '!');
+                const handle = if (second) |i| token[0 .. i + 1] else token[0..1];
+                const suffix = token[handle.len..];
+                if (suffix.len == 0 or !model.isTagHandle(handle)) return null;
+                const prefix = self.handles.get(handle) orelse if (std.mem.eql(u8, handle, "!!"))
+                    model.core_prefix
+                else if (std.mem.eql(u8, handle, "!"))
+                    "!"
+                else
+                    return null;
+                name = try model.expandTag(self.a, prefix, suffix) orelse return null;
+            }
+        }
+        if (end < s.len and !isWhite(s[end]) and !(in_flow and std.mem.findScalar(u8, ",]}", s[end]) != null)) return null;
+        return .{ .name = name, .len = end };
+    }
+
+    fn merge(self: *Parser, outer: Props, inner: Props) Error!Props {
+        if (outer.tag != null and inner.tag != null) return self.err("a node cannot have two tags");
+        return .{ .tag = outer.tag orelse inner.tag, .rest = inner.rest };
+    }
+
+    fn apply(_: *Parser, v: *Value, props: Props) Error!void {
+        const tag = props.tag orelse return;
+        switch (v.*) {
+            .scalar => |*s| {
+                s.tag = tag;
+                s.kind = model.kindOf(tag, s.style, s.text);
+            },
+            .seq => |q| q.tag = tag,
+            .map => |m| m.tag = tag,
+        }
+    }
+
+    /// A node with no content, which may still have properties.
+    fn emptyNode(self: *Parser, props: Props) Error!Value {
+        var v = null_scalar;
+        try self.apply(&v, props);
+        return v;
+    }
+
+    /// Whether nothing but a comment is left of a line.
+    fn endsLine(rest: []const u8) bool {
+        return rest.len == 0 or rest[0] == '#';
+    }
+
+    /// The comment that `endsLine` found, checked but not copied.
+    fn commentOn(self: *Parser, rest: []const u8) Error!?[]const u8 {
+        if (rest.len == 0) return null;
+        const text = std.mem.trimEnd(u8, rest, " \t");
+        try self.checkPrintable(text);
+        return try self.a.dupe(u8, text);
     }
 
     fn isSeqEntry(content: []const u8) bool {
@@ -541,7 +727,8 @@ const Parser = struct {
     fn readNode(self: *Parser, rest_in: []const u8, parent: i64, keys: bool) Error!Node {
         const rest = std.mem.trimStart(u8, rest_in, " \t");
         switch (rest[0]) {
-            '&', '*', '!' => return self.failHere(rest, "anchors, aliases and tags are not supported", error.Unsupported),
+            '*' => return self.failHere(rest, "anchors and aliases are not supported", error.Unsupported),
+            '&', '!' => return self.errAt(rest, "properties cannot stand here"),
             '@', '`' => return self.errAt(rest, "a reserved indicator cannot start a scalar"),
             '%' => return self.errAt(rest, "a '%' cannot start a plain scalar"),
             '"', '\'' => {
@@ -604,15 +791,16 @@ const Parser = struct {
             var j = indent + 1;
             while (j < raw.len and isWhite(raw[j])) j += 1;
             const rest = raw[j..];
+            const props = try self.takeProps(rest);
             var item: Value = undefined;
             var after: ?[]const u8 = null;
-            if (rest.len == 0 or rest[0] == '#') {
-                after = if (rest.len != 0) try self.keepComment(std.mem.trimEnd(u8, rest, " \t")) else null;
+            if (endsLine(props.rest)) {
+                after = try self.commentOn(props.rest);
                 self.pos += 1;
                 try self.skipBlank();
                 const next = try self.cur();
                 const present = next != null and next.?.indent > indent;
-                item = try self.block(@intCast(indent), indent);
+                item = try self.block(@intCast(indent), indent, props, false);
                 // After a null item, pending comments belong to what follows.
                 if (present) {
                     const found = try self.commentsAround(item, before, after);
@@ -623,7 +811,7 @@ const Parser = struct {
                 // The blanks before a collection on the dash's line indent it,
                 // so they must be spaces.
                 const tabbed = std.mem.indexOfScalar(u8, raw[indent..j], '\t') != null;
-                item = try self.collectionOrNode(rest, @intCast(indent), j, tabbed, null, "a tab cannot indent a collection");
+                item = try self.collectionOrNode(rest, props, .{}, @intCast(indent), j, tabbed, null, "a tab cannot indent a collection");
                 after = self.takeTrailing();
             }
             try seq.items.append(self.a, item);
@@ -637,13 +825,21 @@ const Parser = struct {
     /// The key that starts the line at column `indent`.
     fn nextKey(self: *Parser, indent: usize) Error!Key {
         const first_line = self.pos;
-        switch (try self.readNode(self.lines[self.pos][indent..], @intCast(indent), true)) {
-            .key => |key| return key,
-            .value => {
-                self.pos = first_line;
-                return self.err("expected 'key:'");
-            },
+        const rest = std.mem.trimStart(u8, self.lines[self.pos][indent..], " \t");
+        const props = try self.takeProps(rest);
+        if (!endsLine(props.rest)) {
+            switch (try self.readNode(props.rest, @intCast(indent), true)) {
+                .key => |found| {
+                    var key = found;
+                    key.column = indent + 1;
+                    try self.apply(&key.value, props);
+                    return key;
+                },
+                .value => {},
+            }
         }
+        self.pos = first_line;
+        return self.err("expected 'key:'");
     }
 
     /// The mapping whose keys are in column `indent`. The first one has been read.
@@ -655,21 +851,16 @@ const Parser = struct {
             if (map.entries.contains(key.value)) return failAt(self.diag, self.pos + 1, key.column, "duplicate key", error.Syntax);
             var before = try self.takeBefore();
             const rest = std.mem.trimStart(u8, key.rest, " \t");
+            const props = try self.takeProps(rest);
             var v: Value = undefined;
             var after: ?[]const u8 = null;
-            if (rest.len == 0 or rest[0] == '#') {
-                after = if (rest.len != 0) try self.keepComment(std.mem.trimEnd(u8, rest, " \t")) else null;
+            if (endsLine(props.rest)) {
+                after = try self.commentOn(props.rest);
                 self.pos += 1;
                 try self.skipBlank();
                 const next = try self.cur();
                 const deeper = next != null and next.?.indent > indent;
-                if (deeper) {
-                    v = try self.block(@intCast(indent), indent);
-                } else if (next != null and next.?.indent == indent and !next.?.tabbed and isSeqEntry(next.?.content)) {
-                    try self.enter();
-                    defer self.depth -= 1;
-                    v = try self.sequence(indent);
-                } else v = null_scalar;
+                v = try self.block(@intCast(indent), indent, props, true);
                 // After a null value, pending comments belong to what follows.
                 if (v != .scalar or deeper) {
                     const found = try self.commentsAround(v, before, after);
@@ -677,10 +868,12 @@ const Parser = struct {
                     after = found.after;
                 }
             } else {
-                v = (try self.readNode(rest, @intCast(indent), false)).value;
+                v = (try self.readNode(props.rest, @intCast(indent), false)).value;
+                try self.apply(&v, props);
                 after = self.takeTrailing();
             }
-            try map.entries.put(self.a, key.value, .{ .value = v, .comments = .{ .before = before, .after = after } });
+            try map.putValue(self.a, key.value, v);
+            map.entries.values()[map.count() - 1].comments = .{ .before = before, .after = after };
 
             try self.skipBlank();
             const c = (try self.cur()) orelse break;
@@ -1097,8 +1290,29 @@ const Flow = struct {
         };
     }
 
+    /// A node, with any properties before it.
     fn node(self: *Flow) Error!Value {
-        const c = self.peek() orelse return self.err("expected a value in a flow collection");
+        var props: Parser.Props = .{};
+        while (self.peek()) |c| {
+            if (c == '&') return self.p.unsupported("anchors and aliases are not supported");
+            if (c != '!') break;
+            if (props.tag != null) return self.err("a node cannot have two tags");
+            const tag = try self.p.readTag(self.line[self.i..], true) orelse return self.err("bad tag");
+            props.tag = tag.name;
+            self.i += tag.len;
+            try self.skip();
+        }
+        var v: Value = null_scalar;
+        const next = self.peek() orelse return self.err("expected a value in a flow collection");
+        // Properties may be all there is to a node.
+        const empty = props.any() and (next == ',' or next == ']' or next == '}' or (next == ':' and self.separatorFollows()));
+        if (!empty) v = try self.content();
+        try self.p.apply(&v, props);
+        return v;
+    }
+
+    fn content(self: *Flow) Error!Value {
+        const c = self.peek().?;
         switch (c) {
             '[' => return self.seq(),
             '{' => return self.map(),
@@ -1109,7 +1323,8 @@ const Flow = struct {
                 const t = try self.p.decodeQuoted(g.quoted);
                 return .{ .scalar = .{ .text = t, .style = if (c == '"') .double else .single, .kind = .string } };
             },
-            '&', '*', '!' => return self.p.unsupported("anchors, aliases and tags are not supported"),
+            '*' => return self.p.unsupported("anchors and aliases are not supported"),
+            '&', '!' => return self.err("properties cannot stand here"),
             ',', ']', '}' => return self.err("a flow collection entry cannot be empty"),
             '|', '>', '%', '@', '`', '#' => return self.err("this character cannot start a value in a flow collection"),
             '?', ':', '-' => {
@@ -1181,9 +1396,12 @@ const Flow = struct {
         var json_like = false;
         const empty_key = self.peek() == ':' and self.separatorFollows();
         if (!empty_key) {
-            const c = self.peek().?;
-            json_like = c == '"' or c == '\'' or c == '[' or c == '{';
             key = try self.node();
+            // `"key":value` may leave out the blank after the colon.
+            json_like = switch (key) {
+                .scalar => |s| s.style == .single or s.style == .double,
+                else => true,
+            };
         }
         // In a sequence, a pair's key and its `:` share one line.
         if (in_mapping) try self.skip() else self.skipInLine();
@@ -1204,7 +1422,7 @@ const Flow = struct {
         };
         const k: Value = .{ .scalar = s };
         if (m.entries.contains(k)) return self.err("duplicate key");
-        try m.entries.put(self.p.a, k, .{ .value = value });
+        try m.putValue(self.p.a, k, value);
     }
 
     /// Consumes the `,` after an entry, or stops before the closing bracket.

@@ -23,7 +23,7 @@ const Seq = model.Seq;
 const Map = model.Map;
 const Comments = model.Comments;
 
-pub const Error = Writer.Error || error{ InvalidUtf8, NestingTooDeep, InvalidDirective };
+pub const Error = Writer.Error || error{ InvalidUtf8, NestingTooDeep, InvalidDirective, InvalidTag };
 
 pub const Doc = struct {
     root: Value,
@@ -41,15 +41,15 @@ pub const Doc = struct {
 /// Writes one document on its own. Its end needs no marker.
 pub fn write(w: *Writer, doc: Doc) Error!void {
     try check(doc);
-    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1) };
+    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1), .directives = doc.directives };
     try g.document(doc, doc.explicit_start or doc.directives.len != 0);
 }
 
 /// Checks everything about `doc` that can make writing it fail, other than
 /// the output itself. Values and keys can be built by hand, so nothing is
 /// written before the whole tree has passed.
-pub fn check(doc: Doc) error{ InvalidUtf8, NestingTooDeep, InvalidDirective }!void {
-    try checkTree(doc.root, doc.max_depth);
+pub fn check(doc: Doc) error{ InvalidUtf8, NestingTooDeep, InvalidDirective, InvalidTag }!void {
+    try checkTree(doc.root, doc.max_depth, doc.directives);
     try checkComment(.{ .before = doc.header });
     try checkComment(.{ .before = doc.footer });
     try checkComment(doc.root_comments);
@@ -61,7 +61,7 @@ pub fn check(doc: Doc) error{ InvalidUtf8, NestingTooDeep, InvalidDirective }!vo
 /// says whether the one before was closed with `...`, and `next` is the one
 /// that follows. Returns whether this one was closed.
 pub fn writeInStream(w: *Writer, doc: Doc, index: usize, previous_ended: bool, next: ?Doc) Error!bool {
-    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1), .drop_blank = index == 0 };
+    var g: Gen = .{ .w = w, .step = @max(doc.indent, 1), .directives = doc.directives, .drop_blank = index == 0 };
     // Only `---` or `...` keeps two documents apart.
     const start = doc.explicit_start or doc.directives.len != 0 or (index != 0 and !previous_ended);
     try g.document(doc, start);
@@ -82,23 +82,37 @@ fn checkComment(c: Comments) error{InvalidUtf8}!void {
 
 /// Checks the text of every node, and that the collections nest no deeper
 /// than `levels`. The limit also stops at a collection that contains itself.
-fn checkTree(v: Value, levels: u32) error{ InvalidUtf8, NestingTooDeep }!void {
+fn checkTree(v: Value, levels: u32, directives: []const []const u8) error{ InvalidUtf8, NestingTooDeep, InvalidTag }!void {
+    if (tagOf(v)) |tag| _ = try model.tagForm(tag, directives);
     switch (v) {
         .scalar => |s| try checkText(s.text),
         .seq => |q| {
             if (levels == 0) return error.NestingTooDeep;
-            for (q.items.items) |item| try checkTree(item, levels - 1);
+            for (q.items.items) |item| try checkTree(item, levels - 1, directives);
             for (q.comments.items) |c| try checkComment(c);
         },
         .map => |m| {
             if (levels == 0) return error.NestingTooDeep;
             for (m.entries.keys(), m.entries.values()) |k, e| {
-                try checkTree(k, levels - 1);
-                try checkTree(e.value, levels - 1);
+                try checkTree(k, levels - 1, directives);
+                try checkTree(e.value, levels - 1, directives);
                 try checkComment(e.comments);
             }
         },
     }
+}
+
+fn tagOf(v: Value) ?[]const u8 {
+    return switch (v) {
+        .scalar => |s| s.tag,
+        .seq => |q| q.tag,
+        .map => |m| m.tag,
+    };
+}
+
+/// A plain null written as nothing at all.
+fn isBare(s: Scalar) bool {
+    return s.style == .plain and s.text.len == 0 and (s.tag != null or s.kind == .null);
 }
 
 /// Whether `v` is written on one line: a scalar, an empty collection, or a
@@ -128,6 +142,8 @@ fn isInline(v: Value) bool {
 const Gen = struct {
     w: *Writer,
     step: usize,
+    /// The document's directives, which tag shorthands depend on.
+    directives: []const []const u8,
     /// Set where empty comment lines must be left out: at the start of the
     /// output (the reader drops them, so a second write would differ) and
     /// after a block scalar with keep chomping (they would join its value).
@@ -139,15 +155,25 @@ const Gen = struct {
             try self.w.writeAll(line);
             try self.w.writeByte('\n');
         }
+        const after = doc.root_comments.after;
+        // A block collection's tag can share the `---` line, if no comment
+        // has to come between.
+        const tag_on_marker = start and !isInline(doc.root) and tagOf(doc.root) != null and
+            doc.start_comment == null and doc.root_comments.before.len == 0 and after == null;
         if (start) {
             try self.w.writeAll("---");
+            if (tag_on_marker) try self.spacedTag(tagOf(doc.root));
             try self.tail(doc.start_comment);
         }
         try self.lines(doc.root_comments.before, 0);
-        const after = doc.root_comments.after;
         if (isInline(doc.root)) try self.rootInline(doc.root, after) else {
             // A block collection has no line of its own for a trailing comment.
             if (after) |a| try self.lines(&.{a}, 0);
+            if (if (tag_on_marker) null else tagOf(doc.root)) |tag| {
+                try self.pad(0);
+                try self.tagToken(tag);
+                try self.w.writeByte('\n');
+            }
             switch (doc.root) {
                 .map => |m| try self.map(m, 0, false),
                 .seq => |q| try self.seq(q, 0),
@@ -188,17 +214,35 @@ const Gen = struct {
     fn rootInline(self: *Gen, v: Value, after: ?[]const u8) Error!void {
         switch (v) {
             .scalar => |s| {
+                if (s.tag) |tag| {
+                    try self.tagToken(tag);
+                    if (!isBare(s)) try self.w.writeByte(' ');
+                }
                 if (isBlock(s) and blockOk(s.text)) return self.blockScalar(s, 0, after, true);
-                if (s.kind == .null and s.text.len == 0)
-                    try self.w.writeAll("null")
-                else if (s.style == .plain and looksLikeMarker(s.text))
+                if (isBare(s)) {
+                    // Spelled out, so that the document is not empty.
+                    if (s.tag == null) try self.w.writeAll("null");
+                } else if (s.style == .plain and s.tag == null and looksLikeMarker(s.text))
                     try self.double(s.text)
                 else
-                    try self.scalarInline(s, false);
+                    try self.scalarText(s, false);
             },
             else => try self.flow(v),
         }
         try self.tail(after);
+    }
+
+    fn tagToken(self: *Gen, tag: []const u8) Error!void {
+        // `check` has made sure there is a form.
+        try model.writeTag(self.w, model.tagForm(tag, self.directives) catch return error.InvalidTag);
+    }
+
+    /// ` !tag` for a node that has one.
+    fn spacedTag(self: *Gen, tag: ?[]const u8) Error!void {
+        if (tag) |t| {
+            try self.w.writeByte(' ');
+            try self.tagToken(t);
+        }
     }
 
     // ---- block collections ----------------------------------------------------
@@ -220,9 +264,9 @@ const Gen = struct {
         for (q.items.items, q.comments.items) |item, c| {
             try self.lines(c.before, indent);
             switch (item) {
-                // A comment on the dash's line needs the dash on a line of
-                // its own; the mapping then follows in block form below.
-                .map => |m| if (!isInline(item) and c.after == null) {
+                // A comment or tag on the dash's line needs the dash on a line
+                // of its own; the mapping then follows in block form below.
+                .map => |m| if (!isInline(item) and c.after == null and m.tag == null) {
                     // Comments above the first key sit above the dash.
                     const first = m.entries.values()[0].comments;
                     try self.lines(first.before, indent);
@@ -235,7 +279,7 @@ const Gen = struct {
             }
             try self.pad(indent);
             try self.w.writeByte('-');
-            try self.itemValue(item, c.after, indent);
+            try self.entryValue(item, c.after, indent);
         }
     }
 
@@ -243,13 +287,14 @@ const Gen = struct {
     fn entryValue(self: *Gen, v: Value, after: ?[]const u8, indent: usize) Error!void {
         switch (v) {
             .scalar => |s| {
+                try self.spacedTag(s.tag);
                 if (isBlock(s) and blockOk(s.text)) {
                     try self.w.writeByte(' ');
                     return self.blockScalar(s, indent, after, false);
                 }
-                if (s.kind == .null and s.text.len == 0 and s.style == .plain) return self.tail(after);
+                if (isBare(s)) return self.tail(after);
                 try self.w.writeByte(' ');
-                try self.scalarInline(s, false);
+                try self.scalarText(s, false);
                 try self.tail(after);
             },
             .seq, .map => {
@@ -258,6 +303,7 @@ const Gen = struct {
                     try self.flow(v);
                     return self.tail(after);
                 }
+                try self.spacedTag(tagOf(v));
                 try self.tail(after);
                 switch (v) {
                     .seq => |q| try self.seq(q, indent + self.step),
@@ -266,18 +312,6 @@ const Gen = struct {
                 }
             },
         }
-    }
-
-    /// The value after `-` (a mapping that is written on the dash's line is handled by `seq`).
-    fn itemValue(self: *Gen, v: Value, after: ?[]const u8, indent: usize) Error!void {
-        switch (v) {
-            .seq => |q| if (!isInline(v)) {
-                try self.tail(after);
-                return self.seq(q, indent + self.step);
-            },
-            else => {},
-        }
-        try self.entryValue(v, after, indent);
     }
 
     // ---- scalars ---------------------------------------------------------------
@@ -339,10 +373,12 @@ const Gen = struct {
     /// A scalar key. A key added through the API is a string, so `plainOk`
     /// has it quoted if plain text would read as another type.
     fn key(self: *Gen, k: Scalar, at_column_0: bool, in_flow: bool) Error!void {
-        // `: value`, an empty plain key.
-        if (k.style == .plain and k.kind == .null and k.text.len == 0) return;
-        if (at_column_0 and k.style == .plain and looksLikeMarker(k.text)) return self.double(k.text);
-        try self.scalarInline(k, in_flow);
+        if (k.tag) |tag| try self.tagToken(tag);
+        // `: value`, an empty plain key. A blank keeps a tag clear of the colon.
+        if (isBare(k)) return if (k.tag != null) self.w.writeByte(' ');
+        if (k.tag != null) try self.w.writeByte(' ');
+        if (at_column_0 and k.style == .plain and k.tag == null and looksLikeMarker(k.text)) return self.double(k.text);
+        try self.scalarText(k, in_flow);
     }
 
     /// A plain scalar cannot start with an indicator, except for `-`, `?` and
@@ -368,14 +404,15 @@ const Gen = struct {
 
     fn plainOk(s: Scalar, in_flow: bool) bool {
         if (s.text.len == 0) return false;
-        if (model.resolve(s.text) != s.kind) return false;
+        if (model.kindOf(s.tag, .plain, s.text) != s.kind) return false;
         if (!indicatorOk(s.text)) return false;
         if (!plainBody(s.text)) return false;
         if (in_flow and std.mem.findAny(u8, s.text, ",[]{}") != null) return false;
         return true;
     }
 
-    fn scalarInline(self: *Gen, s: Scalar, in_flow: bool) Error!void {
+    /// A scalar's content on one line, without its tag.
+    fn scalarText(self: *Gen, s: Scalar, in_flow: bool) Error!void {
         switch (s.style) {
             .plain => {
                 if (plainOk(s, in_flow)) return self.w.writeAll(s.text);
@@ -448,10 +485,20 @@ const Gen = struct {
     // ---- flow ------------------------------------------------------------------------
 
     fn flow(self: *Gen, v: Value) Error!void {
+        if (v != .scalar) {
+            if (tagOf(v)) |tag| {
+                try self.tagToken(tag);
+                try self.w.writeByte(' ');
+            }
+        }
         switch (v) {
             .scalar => |s| {
-                if (s.kind == .null and s.text.len == 0 and s.style == .plain) return self.w.writeAll("null");
-                try self.scalarInline(s, true);
+                if (s.tag) |tag| {
+                    try self.tagToken(tag);
+                    if (isBare(s)) return self.w.writeByte(' ');
+                    try self.w.writeByte(' ');
+                } else if (isBare(s)) return self.w.writeAll("null");
+                try self.scalarText(s, true);
             },
             .seq => |q| {
                 try self.w.writeByte('[');

@@ -270,7 +270,7 @@ pub const Document = struct {
     }
 };
 
-pub const ToStringError = Allocator.Error || error{ WriteFailed, InvalidUtf8, NestingTooDeep, InvalidDirective };
+pub const ToStringError = Allocator.Error || error{ WriteFailed, InvalidUtf8, NestingTooDeep, InvalidDirective, InvalidTag };
 
 fn toString(value: anytype, gpa: Allocator) ToStringError![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
@@ -278,7 +278,7 @@ fn toString(value: anytype, gpa: Allocator) ToStringError![]u8 {
     value.write(&aw.writer) catch |e| switch (e) {
         // An allocating writer fails only when it cannot grow.
         error.WriteFailed => return error.OutOfMemory,
-        error.InvalidUtf8, error.NestingTooDeep, error.InvalidDirective => |other| return other,
+        error.InvalidUtf8, error.NestingTooDeep, error.InvalidDirective, error.InvalidTag => |other| return other,
     };
     return aw.toOwnedSlice();
 }

@@ -19,9 +19,13 @@ pub const Scalar = struct {
     text: []const u8,
     style: Style = .plain,
     kind: Kind = .string,
+    /// The tag written on the node, in full (`tag:yaml.org,2002:str`,
+    /// `!local`, or `!` for the non-specific tag), or null if it has none.
+    tag: ?[]const u8 = null,
 
     pub fn asBool(self: Scalar) ?bool {
-        if (self.kind != .boolean) return null;
+        // A tag can give the kind to text that is not a boolean.
+        if (self.kind != .boolean or resolve(self.text) != .boolean) return null;
         return std.ascii.eqlIgnoreCase(self.text, "true");
     }
 
@@ -73,6 +77,22 @@ fn parseInt(t: []const u8) ?i64 {
     if (t.len > 2 and t[0] == '0' and t[1] == 'x') return std.fmt.parseInt(i64, t[2..], 16) catch null;
     if (t.len > 2 and t[0] == '0' and t[1] == 'o') return std.fmt.parseInt(i64, t[2..], 8) catch null;
     return std.fmt.parseInt(i64, t, 10) catch null;
+}
+
+/// The prefix of the tags the specification defines, written `!!`.
+pub const core_prefix = "tag:yaml.org,2002:";
+
+/// What a scalar means, given its tag, style and text. A tag decides; a tag
+/// this library does not interpret leaves the scalar a string.
+pub fn kindOf(tag: ?[]const u8, style: Style, text: []const u8) Kind {
+    const t = tag orelse return if (style == .plain) resolve(text) else .string;
+    if (!std.mem.startsWith(u8, t, core_prefix)) return .string;
+    const name = t[core_prefix.len..];
+    if (std.mem.eql(u8, name, "null")) return .null;
+    if (std.mem.eql(u8, name, "bool")) return .boolean;
+    if (std.mem.eql(u8, name, "int")) return .integer;
+    if (std.mem.eql(u8, name, "float")) return .float;
+    return .string;
 }
 
 /// The meaning of a plain scalar under the core schema (YAML 1.2.2, 10.3.2).
@@ -257,6 +277,94 @@ pub fn isUri(s: []const u8) bool {
     return true;
 }
 
+/// What may stand between `!<` and `>`: a local tag (`!` and more) or a URI
+/// with a scheme.
+pub fn isVerbatimTag(uri: []const u8) bool {
+    if (uri.len == 0 or !isUri(uri)) return false;
+    if (uri[0] == '!') return uri.len > 1;
+    const colon = std.mem.indexOfScalar(u8, uri, ':') orelse return false;
+    if (colon == 0 or !std.ascii.isAlphabetic(uri[0])) return false;
+    for (uri[0..colon]) |c| if (!std.ascii.isAlphanumeric(c) and c != '+' and c != '-' and c != '.') return false;
+    return true;
+}
+
+/// A character of a tag shorthand's suffix that needs no `%XX`.
+fn isTagChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or std.mem.findScalar(u8, "-#;/?:@&=+$_.~*'()", c) != null;
+}
+
+/// `prefix` and the decoded `suffix` of a shorthand, or null if the suffix is
+/// badly formed.
+pub fn expandTag(arena: Allocator, prefix: []const u8, suffix: []const u8) Allocator.Error!?[]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    try out.appendSlice(arena, prefix);
+    var i: usize = 0;
+    while (i < suffix.len) : (i += 1) {
+        if (suffix[i] == '%') {
+            if (i + 2 >= suffix.len) return null;
+            const byte = std.fmt.parseInt(u8, suffix[i + 1 .. i + 3], 16) catch return null;
+            if (!std.ascii.isHex(suffix[i + 1]) or !std.ascii.isHex(suffix[i + 2])) return null;
+            try out.append(arena, byte);
+            i += 2;
+        } else if (isTagChar(suffix[i])) {
+            try out.append(arena, suffix[i]);
+        } else return null;
+    }
+    if (!std.unicode.utf8ValidateSlice(out.items)) return null;
+    return out.items;
+}
+
+/// How a tag is written: a handle and a suffix, or whole as `!<...>`.
+pub const TagForm = union(enum) {
+    non_specific,
+    shorthand: struct { handle: []const u8, suffix: []const u8 },
+    verbatim: []const u8,
+};
+
+/// Chooses a form that reads back as `tag` in a document with `directives`, or
+/// fails if there is none.
+pub fn tagForm(tag: []const u8, directives: []const []const u8) error{InvalidTag}!TagForm {
+    if (tag.len == 0 or !std.unicode.utf8ValidateSlice(tag)) return error.InvalidTag;
+    if (std.mem.eql(u8, tag, "!")) return .non_specific;
+    var primary: []const u8 = "!";
+    var secondary: []const u8 = core_prefix;
+    var named: ?TagForm = null;
+    var best: usize = 0;
+    for (directives) |line| {
+        const d = parseDirective(line) catch continue;
+        if (d != .tag) continue;
+        if (std.mem.eql(u8, d.tag.handle, "!")) {
+            primary = d.tag.prefix;
+        } else if (std.mem.eql(u8, d.tag.handle, "!!")) {
+            secondary = d.tag.prefix;
+        } else if (d.tag.prefix.len > best and d.tag.prefix.len < tag.len and std.mem.startsWith(u8, tag, d.tag.prefix)) {
+            best = d.tag.prefix.len;
+            named = .{ .shorthand = .{ .handle = d.tag.handle, .suffix = tag[best..] } };
+        }
+    }
+    if (named) |form| return form;
+    for ([_][2][]const u8{ .{ "!!", secondary }, .{ "!", primary } }) |pair| {
+        if (pair[1].len < tag.len and std.mem.startsWith(u8, tag, pair[1]))
+            return .{ .shorthand = .{ .handle = pair[0], .suffix = tag[pair[1].len..] } };
+    }
+    if (isVerbatimTag(tag)) return .{ .verbatim = tag };
+    return error.InvalidTag;
+}
+
+/// Writes `form`, escaping what a suffix cannot hold as `%XX`.
+pub fn writeTag(w: *std.Io.Writer, form: TagForm) std.Io.Writer.Error!void {
+    switch (form) {
+        .non_specific => try w.writeByte('!'),
+        .verbatim => |uri| try w.print("!<{s}>", .{uri}),
+        .shorthand => |s| {
+            try w.writeAll(s.handle);
+            for (s.suffix) |c| {
+                if (isTagChar(c)) try w.writeByte(c) else try w.print("%{X:0>2}", .{c});
+            }
+        },
+    }
+}
+
 /// A comment line must be empty or start with `#` (after blanks, which are
 /// not written: comments take their item's indent); a trailing
 /// comment must start with `#`; both must be valid UTF-8 without line breaks
@@ -279,6 +387,8 @@ pub const Seq = struct {
     comments: std.ArrayList(Comments) = .empty,
     /// Written as `[a, b]` (only if no item is a block collection).
     flow: bool = false,
+    /// As `Scalar.tag`.
+    tag: ?[]const u8 = null,
 
     pub fn append(self: *Seq, arena: Allocator, v: Value) Allocator.Error!void {
         try self.items.append(arena, v);
@@ -309,6 +419,9 @@ const compare_budget: usize = 1 << 16;
 /// The tag that decides what a scalar is: its own, or the one the core schema
 /// gives it.
 fn effectiveTag(s: Scalar) []const u8 {
+    if (s.tag) |t| {
+        if (s.kind == .string and !std.mem.eql(u8, t, "!")) return t;
+    }
     return switch (s.kind) {
         .null => "tag:yaml.org,2002:null",
         .boolean => "tag:yaml.org,2002:bool",
@@ -384,13 +497,13 @@ fn sameKey(a: Value, b: Value, budget: *usize) bool {
         },
         .seq => |q| {
             if (q == b.seq) return true;
-            if (q.items.items.len != b.seq.items.items.len) return false;
+            if (!sameTag(q.tag, b.seq.tag) or q.items.items.len != b.seq.items.items.len) return false;
             for (q.items.items, b.seq.items.items) |i, j| if (!sameKey(i, j, budget)) return false;
             return true;
         },
         .map => |m| {
             if (m == b.map) return true;
-            if (m.count() != b.map.count()) return false;
+            if (!sameTag(m.tag, b.map.tag) or m.count() != b.map.count()) return false;
             for (m.entries.keys(), m.entries.values()) |k, e| {
                 const other = b.map.entries.get(k) orelse return false;
                 if (!sameKey(e.value, other.value, budget)) return false;
@@ -400,10 +513,19 @@ fn sameKey(a: Value, b: Value, budget: *usize) bool {
     }
 }
 
+/// Whether two collections' tags are the same: no tag and `!` say the same.
+fn sameTag(a: ?[]const u8, b: ?[]const u8) bool {
+    const x = if (a) |t| if (std.mem.eql(u8, t, "!")) null else t else null;
+    const y = if (b) |t| if (std.mem.eql(u8, t, "!")) null else t else null;
+    if (x == null or y == null) return x == null and y == null;
+    return std.mem.eql(u8, x.?, y.?);
+}
+
 /// Finds a scalar key written as `text` and typed `kind`.
 const TextKey = struct {
     kind: Kind,
 
+    // A key with a tag of its own is found by text only through `find`'s scan.
     pub fn hash(self: TextKey, text: []const u8) u32 {
         const s: Scalar = .{ .text = text, .kind = self.kind };
         var buffer: [64]u8 = undefined;
@@ -424,6 +546,10 @@ pub const Map = struct {
     entries: Entries = .empty,
     /// Written as `{a: 1, b: 2}`.
     flow: bool = false,
+    /// As `Scalar.tag`.
+    tag: ?[]const u8 = null,
+    /// Some key has a tag; `putValue` keeps this up to date.
+    tagged_keys: bool = false,
 
     pub const Entry = struct {
         value: Value,
@@ -445,8 +571,16 @@ pub const Map = struct {
     pub fn find(self: *const Map, text: []const u8) ?usize {
         if (self.entries.getIndexAdapted(text, TextKey{ .kind = .string })) |i| return i;
         const kind = resolve(text);
-        if (kind == .string) return null;
-        return self.entries.getIndexAdapted(text, TextKey{ .kind = kind });
+        if (kind != .string) {
+            if (self.entries.getIndexAdapted(text, TextKey{ .kind = kind })) |i| return i;
+        }
+        // Keys with a tag this library does not interpret hash differently.
+        if (self.tagged_keys) {
+            for (self.entries.keys(), 0..) |k, i| {
+                if (k == .scalar and k.scalar.tag != null and std.mem.eql(u8, k.scalar.text, text)) return i;
+            }
+        }
+        return null;
     }
 
     pub fn get(self: *const Map, key: []const u8) ?Value {
@@ -516,6 +650,7 @@ pub const Map = struct {
 
     /// `put` for a key of any kind.
     pub fn putValue(self: *Map, arena: Allocator, key: Value, v: Value) Allocator.Error!void {
+        if (key == .scalar and key.scalar.tag != null) self.tagged_keys = true;
         const gop = try self.entries.getOrPut(arena, key);
         if (gop.found_existing) {
             gop.value_ptr.value = v;

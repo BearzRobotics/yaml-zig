@@ -196,14 +196,18 @@ fn sameStructure(a: std.mem.Allocator, documents: []const yaml.Document, expecte
 
 fn events(w: *std.Io.Writer, v: yaml.Value) !void {
     switch (v) {
-        .scalar => |s| try scalarEvent(w, s.style, s.text),
+        .scalar => |s| try scalarEvent(w, s),
         .seq => |q| {
-            try w.print("+SEQ{s}\n", .{if (q.flow) " []" else ""});
+            try w.print("+SEQ{s}", .{if (q.flow) " []" else ""});
+            try tagEvent(w, q.tag);
+            try w.writeByte('\n');
             for (q.items.items) |item| try events(w, item);
             try w.writeAll("-SEQ\n");
         },
         .map => |m| {
-            try w.print("+MAP{s}\n", .{if (m.flow) " {}" else ""});
+            try w.print("+MAP{s}", .{if (m.flow) " {}" else ""});
+            try tagEvent(w, m.tag);
+            try w.writeByte('\n');
             for (m.entries.keys(), m.entries.values()) |k, e| {
                 try events(w, k);
                 try events(w, e.value);
@@ -213,16 +217,22 @@ fn events(w: *std.Io.Writer, v: yaml.Value) !void {
     }
 }
 
-fn scalarEvent(w: *std.Io.Writer, style: yaml.Style, text: []const u8) !void {
-    const indicator: u8 = switch (style) {
+fn tagEvent(w: *std.Io.Writer, tag: ?[]const u8) !void {
+    if (tag) |t| try w.print(" <{s}>", .{t});
+}
+
+fn scalarEvent(w: *std.Io.Writer, s: yaml.Scalar) !void {
+    const indicator: u8 = switch (s.style) {
         .plain => ':',
         .single => '\'',
         .double => '"',
         .literal => '|',
         .folded => '>',
     };
-    try w.print("=VAL {c}", .{indicator});
-    for (text) |c| switch (c) {
+    try w.writeAll("=VAL");
+    try tagEvent(w, s.tag);
+    try w.print(" {c}", .{indicator});
+    for (s.text) |c| switch (c) {
         '\\' => try w.writeAll("\\\\"),
         '\n' => try w.writeAll("\\n"),
         '\t' => try w.writeAll("\\t"),

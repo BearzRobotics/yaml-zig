@@ -227,7 +227,6 @@ test "strings that need quoting are quoted" {
 test "unsupported and invalid input is rejected" {
     try rejects("a: &x 1\n", error.Unsupported);
     try rejects("a: *x\n", error.Unsupported);
-    try rejects("a: !!str 1\n", error.Unsupported);
     try rejects("? a\n: b\n", error.Unsupported);
     try rejects("a: 1\n---\nb: 2\n", error.Unsupported);
     try rejects("a: 1\na: 2\n", error.Syntax);
@@ -307,6 +306,7 @@ test "no leaks or swallowed errors on allocation failure" {
     for (sources) |src| try testing.checkAllAllocationFailures(testing.allocator, parseAndWrite, .{src});
     try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "%YAML 1.2\n---\na: [1]\n# c\n...\n# d\n---\nb\n---\n")});
     try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "# nothing\n")});
+    try testing.checkAllAllocationFailures(testing.allocator, streamAndWrite, .{@as([]const u8, "%TAG !e! x:\n--- !e!a\n!!str k: !<a:b> [!c v]\nl:\n  !t\n  # c\n  - !!int 1\n")});
     try testing.checkAllAllocationFailures(testing.allocator, buildAndEdit, .{});
     try testing.checkAllAllocationFailures(testing.allocator, readAll, .{});
 }
@@ -331,7 +331,7 @@ test "random bytes never crash the parser" {
 // tree, and writing that again gives the same text. The input is random
 // strings of YAML's own tokens, so that much of it parses.
 test "every accepted input survives writing" {
-    const tokens = [_][]const u8{ "a", "b", ":", " ", " ", " ", "  ", "\n", "\n", "\n", "- ", "-", "#", " # c", "\"", "'", "[", "]", "{", "}", ",", "|", ">", "+", "2", ".", "...", "---", "\\", "\t", "k: ", "x", "\r", "?", "&", "true", "null", "\\n", "|2", ">-", "\n  ", "\n- ", ": ", "\u{85}", "\u{7f}" };
+    const tokens = [_][]const u8{ "!", "!!str ", "!!int", "!t ", "!<a:b> ", "!e!x ", "! ", "a", "b", ":", " ", " ", " ", "  ", "\n", "\n", "\n", "- ", "-", "#", " # c", "\"", "'", "[", "]", "{", "}", ",", "|", ">", "+", "2", ".", "...", "---", "\\", "\t", "k: ", "x", "\r", "?", "&", "true", "null", "\\n", "|2", ">-", "\n  ", "\n- ", ": ", "\u{85}", "\u{7f}" };
     var prng = std.Random.DefaultPrng.init(1);
     const rnd = prng.random();
     var buf: std.ArrayList(u8) = .empty;
@@ -354,7 +354,7 @@ test "every accepted input survives writing" {
         try testing.expectEqualStrings(out, again);
     }
     // The same for whole streams, which have more ways to join documents.
-    const stream_tokens = tokens ++ [_][]const u8{ "---\n", "...\n", "%YAML 1.2\n", "%TAG !e! x:\n", "\n---\n", "\n...\n" };
+    const stream_tokens = tokens ++ [_][]const u8{ "---\n", "...\n", "%YAML 1.2\n", "%TAG !e! x:\n", "%TAG !! y:\n", "%TAG ! !z-\n", "\n---\n", "\n...\n" };
     for (0..40_000) |_| {
         buf.clearRetainingCapacity();
         for (0..rnd.uintLessThan(usize, 18)) |_| try buf.appendSlice(testing.allocator, stream_tokens[rnd.uintLessThan(usize, stream_tokens.len)]);
@@ -384,14 +384,17 @@ fn expectSame(a: yaml.Value, b: yaml.Value) !void {
     try testing.expectEqual(std.meta.activeTag(a), std.meta.activeTag(b));
     switch (a) {
         .scalar => |s| {
+            try testing.expectEqualDeep(s.tag, b.scalar.tag);
             try testing.expectEqual(s.kind, b.scalar.kind);
             if (s.kind != .null) try testing.expectEqualStrings(s.text, b.scalar.text);
         },
         .seq => |q| {
+            try testing.expectEqualDeep(q.tag, b.seq.tag);
             try testing.expectEqual(q.items.items.len, b.seq.items.items.len);
             for (q.items.items, b.seq.items.items) |x, y| try expectSame(x, y);
         },
         .map => |m| {
+            try testing.expectEqualDeep(m.tag, b.map.tag);
             try testing.expectEqual(m.count(), b.map.count());
             for (m.entries.keys(), m.entries.values(), b.map.entries.keys(), b.map.entries.values()) |k, x, k2, y| {
                 try expectSame(k, k2);
@@ -520,7 +523,6 @@ test "content on the '---' line" {
 
 test "anchors, tags and aliases on keys are refused, not read as text" {
     try rejects("&a key: v\n", error.Unsupported);
-    try rejects("!!str a: 1\n", error.Unsupported);
     try rejects("*a : 1\n", error.Unsupported);
     try rejects("- &a x: 1\n", error.Unsupported);
     try rejects("a: 1\n&b c: 2\n", error.Unsupported);
@@ -1175,4 +1177,103 @@ test "keys are equal when YAML says they are" {
     const out = try doc.toOwnedString(testing.allocator);
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("\"1\": string\n2: zwei\n0x1F: hex\n\"3\": drei\n", out);
+}
+
+test "standard tags decide a value's type" {
+    var doc = try parse("a: !!str 12\nb: !!int \"12\"\nc: ! true\nd: !!null x\ne: !!bool abc\nf: !!float 1\ng: !custom 12\nh: !!str\n");
+    defer doc.deinit();
+    const m = doc.root.map;
+    try testing.expectEqual(@as(?i64, null), m.getInt("a"));
+    try testing.expectEqualStrings("tag:yaml.org,2002:str", m.get("a").?.scalar.tag.?);
+    try testing.expectEqual(@as(?i64, 12), m.getInt("b"));
+    try testing.expectEqual(yaml.Kind.string, m.get("c").?.scalar.kind);
+    try testing.expectEqualStrings("!", m.get("c").?.scalar.tag.?);
+    try testing.expect(m.get("d").?.scalar.isNull());
+    // A tag can name a type the text does not spell.
+    try testing.expectEqual(@as(?bool, null), m.getBool("e"));
+    try testing.expectEqual(@as(?f64, 1), m.getFloat("f"));
+    try testing.expectEqual(yaml.Kind.string, m.get("g").?.scalar.kind);
+    try testing.expectEqualStrings("!custom", m.get("g").?.scalar.tag.?);
+    try testing.expectEqualStrings("", m.getString("h").?);
+    try testing.expectEqual(yaml.Kind.string, m.get("h").?.scalar.kind);
+}
+
+test "tags are written back, wherever they stand" {
+    try roundTrips("a: !!str 12\nb: !local\n  c: !<tag:example.com,2000:x> y\nd: !s\n  - !!int 1\n  - !m\n    k: v\n  - !e\n  - !f # why\n    k: v\n");
+    try roundTrips("!!str a: !t\n!u : empty key\nf: !!seq [!a x, !b , !!map {!c k: !d }]\ng: !p |\n  text\nh: ! 12\n");
+    try roundTrips("--- !root\na: 1\n");
+    try roundTrips("!r\n- 1\n");
+    try roundTrips("!just-a-tag\n");
+    try roundTrips("- !t k: v\n  !u l: w\n");
+    try expectStable("a: !!map\n  !!str b: 1\n", "a: !!map\n  !!str b: 1\n");
+    // Properties may be on a line of their own, even for a sequence in its
+    // key's column.
+    try expectStable("a: !t # c\n- 1\nb:\n  !u\n  x: 1\n", "a: !t # c\n  - 1\nb: !u\n  x: 1\n");
+}
+
+test "tag handles come from the document's directives" {
+    const src = "%TAG !e! tag:example.com,2000:app/\n%TAG !! tag:other.org:\n%TAG ! !pre-\n---\n- !e!foo%21 a\n- !!str b\n- !bar c\n- !<!bar> d\n- !<tag:yaml.org,2002:str> e\n";
+    var doc = try parse(src);
+    defer doc.deinit();
+    const items = doc.root.seq.items.items;
+    try testing.expectEqualStrings("tag:example.com,2000:app/foo!", items[0].scalar.tag.?);
+    try testing.expectEqualStrings("tag:other.org:str", items[1].scalar.tag.?);
+    try testing.expectEqualStrings("!pre-bar", items[2].scalar.tag.?);
+    try testing.expectEqualStrings("!bar", items[3].scalar.tag.?);
+    try testing.expectEqualStrings("tag:yaml.org,2002:str", items[4].scalar.tag.?);
+    var back = try writeAndRead(&doc);
+    defer back.deinit();
+    try expectSame(doc.root, back.root);
+}
+
+test "tags set through the API are written in a form that reads back" {
+    var doc = try yaml.Document.init(testing.allocator);
+    defer doc.deinit();
+    const tags = [_][]const u8{ "tag:yaml.org,2002:str", "!local", "!with space", "!a!b", "!x,y", "tag:example.com,2000:t", "!", "!caf\u{e9}", "!100%" };
+    for (tags, 0..) |tag, i| {
+        var v = try doc.string("v");
+        v.scalar.tag = tag;
+        var name: [8]u8 = undefined;
+        try doc.set(&.{try std.fmt.bufPrint(&name, "k{d}", .{i})}, v);
+    }
+    var back = try writeAndRead(&doc);
+    defer back.deinit();
+    try expectSame(doc.root, back.root);
+    // Neither a handle nor '!<...>' can hold this.
+    var bad = try doc.string("v");
+    bad.scalar.tag = "not a uri";
+    try doc.set(&.{"bad"}, bad);
+    try testing.expectError(error.InvalidTag, doc.toOwnedString(testing.allocator));
+}
+
+test "bad tags are rejected" {
+    for ([_][]const u8{
+        "a: !<> x\n",   "a: !<!> x\n",    "a: !<$:?> x\n", "a: !e!foo x\n",  "a: !!\n",
+        "a: !x{y} 1\n", "a: !t%zz 1\n",   "a: !a !b 1\n",  "- !a\n  !b x\n", "a: !t - x\n",
+        "!t - a\n",     "a: !<tag:x y\n", "[!a !b x]\n",   "a: !t%ff x\n",
+    }) |src| {
+        errdefer std.debug.print("source: {s}\n", .{src});
+        try rejects(src, error.Syntax);
+    }
+    // A handle is known only to the document that declares it.
+    try rejectsStream("%TAG !e! x:\n--- !e!a\n--- !e!b\n", error.Syntax);
+}
+
+test "keys with tags" {
+    try rejects("!!str a: 1\na: 2\n", error.Syntax);
+    var doc = try parse("!!int \"1\": a\n!x name: b\nname: c\n!y other: d\n");
+    defer doc.deinit();
+    const m = doc.root.map;
+    try testing.expectEqualStrings("a", m.getString("1").?);
+    // The untagged string wins; a tagged key is found when it is alone.
+    try testing.expectEqualStrings("c", m.getString("name").?);
+    try testing.expectEqualStrings("d", m.getString("other").?);
+}
+
+test "an empty tagged value does not take the comments after it" {
+    for ([_][]const u8{ "!!int\n# after\n", "a: !t\n# before b\nb: 1\n", "- !t\n# before x\n- x\n" }) |src| {
+        try roundTrips(src);
+    }
+    try expectStable("a:\n  # above\n  !t\n# before b\nb: 1\n", "# above\na: !t\n# before b\nb: 1\n");
+    try expectStable("# top\n!t\n# end\n", "# top\n!t\n# end\n");
 }
